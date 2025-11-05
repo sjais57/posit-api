@@ -9,6 +9,18 @@ import subprocess
 from typing import List, Dict, Any, Optional
 from enum import Enum
 from datetime import datetime
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('session_management.log')
+    ]
+)
+logger = logging.getLogger("session_management")
 
 app = FastAPI(title="Session Management API", version="1.0.0")
 
@@ -115,10 +127,12 @@ def get_base_url(env: Environment, project: Project) -> str:
     """Get base URL based on environment and project"""
     base_url = ENV_PROJECT_MAP.get(env, {}).get(project)
     if not base_url:
+        logger.error(f"No base URL configured for environment '{env}' and project '{project}'")
         raise HTTPException(
             status_code=400,
             detail=f"No base URL configured for environment '{env}' and project '{project}'"
         )
+    logger.debug(f"Base URL for {env}/{project}: {base_url}")
     return base_url
 
 def format_base_url(base_url: str) -> str:
@@ -138,6 +152,7 @@ def load_tokens_data(force_reload: bool = False) -> Dict[str, Any]:
         
         # Check if file exists
         if not os.path.exists(token_file_path):
+            logger.error(f"Token file '{TOKENS_FILE}' not found at {token_file_path}")
             raise FileNotFoundError(f"Token file '{TOKENS_FILE}' not found")
         
         # Check if file has been modified
@@ -148,13 +163,15 @@ def load_tokens_data(force_reload: bool = False) -> Dict[str, Any]:
             with open(token_file_path, 'r') as file:
                 TOKENS_DATA = json.load(file)
             TOKENS_LAST_MODIFIED = current_mtime
-            print(f"Tokens data reloaded at {datetime.now()}")
+            logger.info(f"Tokens data reloaded at {datetime.now()}")
             
         return TOKENS_DATA
             
     except json.JSONDecodeError as e:
+        logger.error(f"Error parsing JSON file '{TOKENS_FILE}': {e}")
         raise HTTPException(status_code=400, detail=f"Error parsing JSON file '{TOKENS_FILE}': {e}")
     except Exception as e:
+        logger.error(f"Error loading token file: {e}")
         raise HTTPException(status_code=500, detail=f"Error loading token file: {e}")
 
 def get_token_from_memory(project_name: str, env: Environment, username: str) -> str:
@@ -164,16 +181,20 @@ def get_token_from_memory(project_name: str, env: Environment, username: str) ->
     # Navigate through the nested structure: project_name -> env -> username
     project_data = tokens_data.get(project_name)
     if not project_data:
+        logger.warning(f"Project '{project_name}' not found in token file")
         raise HTTPException(status_code=404, detail=f"Project '{project_name}' not found in token file")
     
     env_data = project_data.get(env.value)
     if not env_data:
+        logger.warning(f"Environment '{env}' not found for project '{project_name}'")
         raise HTTPException(status_code=404, detail=f"Environment '{env}' not found for project '{project_name}'")
     
     token = env_data.get(username)
     if not token:
+        logger.warning(f"Token not found for user '{username}' in project '{project_name}', environment '{env}'")
         raise HTTPException(status_code=404, detail=f"Token not found for user '{username}' in project '{project_name}', environment '{env}'")
     
+    logger.debug(f"Token found for user '{username}' in {project_name}/{env.value}")
     return token
 
 def get_available_users_from_memory(project: Optional[Project] = None, env: Optional[Environment] = None) -> List[str]:
@@ -196,9 +217,11 @@ def get_available_users_from_memory(project: Optional[Project] = None, env: Opti
                 env_data = project_data.get(env_name, {})
                 users.update(env_data.keys())
         
+        logger.debug(f"Found {len(users)} available users for project={project}, env={env}")
         return sorted(list(users))
         
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error getting available users: {e}")
         return []
 
 def generate_user_token(username: str) -> str:
@@ -213,6 +236,9 @@ def generate_user_token(username: str) -> str:
             username
         ]
         
+        logger.info(f"Executing token generation command for user: {username}")
+        logger.debug(f"Command: {' '.join(cmd)}")
+        
         # Execute the command
         result = subprocess.run(
             cmd, 
@@ -220,6 +246,11 @@ def generate_user_token(username: str) -> str:
             text=True, 
             check=True
         )
+        
+        logger.info(f"Token generation command executed successfully for user: {username}")
+        logger.debug(f"Command stdout: {result.stdout}")
+        if result.stderr:
+            logger.debug(f"Command stderr: {result.stderr}")
         
         # Parse the output to extract the token using awk-like logic
         output_lines = result.stdout.split('\n')
@@ -230,19 +261,24 @@ def generate_user_token(username: str) -> str:
                 if len(parts) >= 2:
                     token = parts[1].strip()
                     if token:  # Ensure it's not empty
+                        logger.info(f"Token successfully extracted for user {username}")
                         return token
         
         # If no token found in pipe format, try to find any non-empty line
         for line in output_lines:
             stripped_line = line.strip()
             if stripped_line and not stripped_line.startswith('#'):
+                logger.info(f"Using non-pipe formatted token for user {username}")
                 return stripped_line
                 
+        logger.error(f"No token found in command output for user {username}")
         raise Exception("No token found in command output")
         
     except subprocess.CalledProcessError as e:
+        logger.error(f"Token generation command failed for user {username}: {e.stderr}")
         raise Exception(f"Token generation command failed: {e.stderr}")
     except Exception as e:
+        logger.error(f"Error generating token for user {username}: {str(e)}")
         raise Exception(f"Error generating token: {str(e)}")
 
 def add_token_to_file(project: Project, env: Environment, username: str, token: str) -> None:
@@ -251,19 +287,32 @@ def add_token_to_file(project: Project, env: Environment, username: str, token: 
         script_dir = os.path.dirname(os.path.abspath(__file__))
         token_file_path = os.path.join(script_dir, TOKENS_FILE)
         
+        logger.info(f"Adding token for user '{username}' in {project.value}/{env.value}")
+        
         # Read existing data
         if os.path.exists(token_file_path):
             with open(token_file_path, 'r') as file:
                 tokens_data = json.load(file)
+            logger.debug(f"Successfully read existing token file")
         else:
+            logger.info(f"Token file does not exist, creating new file")
             tokens_data = {}
         
         # Ensure the nested structure exists
         if project.value not in tokens_data:
+            logger.info(f"Creating new project section: {project.value}")
             tokens_data[project.value] = {}
         
         if env.value not in tokens_data[project.value]:
+            logger.info(f"Creating new environment section: {env.value}")
             tokens_data[project.value][env.value] = {}
+        
+        # Check if user already exists
+        user_exists = username in tokens_data[project.value][env.value]
+        if user_exists:
+            logger.warning(f"Overwriting existing token for user '{username}' in {project.value}/{env.value}")
+        else:
+            logger.info(f"Adding new user '{username}' to {project.value}/{env.value}")
         
         # Add or update the token
         tokens_data[project.value][env.value][username] = token
@@ -277,9 +326,10 @@ def add_token_to_file(project: Project, env: Environment, username: str, token: 
         TOKENS_DATA = tokens_data
         TOKENS_LAST_MODIFIED = os.path.getmtime(token_file_path)
         
-        print(f"Successfully added token for user '{username}' in {project.value}/{env.value}")
+        logger.info(f"Successfully added token for user '{username}' in {project.value}/{env.value}")
         
     except Exception as e:
+        logger.error(f"Error updating token file for user {username}: {str(e)}")
         raise Exception(f"Error updating token file: {str(e)}")
 
 def get_or_create_user_token(project: Project, env: Environment, username: str) -> tuple[str, str]:
@@ -290,6 +340,7 @@ def get_or_create_user_token(project: Project, env: Environment, username: str) 
     try:
         # First try to get existing token
         token = get_token_from_memory(project.value, env, username)
+        logger.info(f"Found existing token for user '{username}' in {project.value}/{env.value}")
         return username, token
         
     except HTTPException as e:
@@ -300,28 +351,31 @@ def get_or_create_user_token(project: Project, env: Environment, username: str) 
             
             if has_access:
                 try:
-                    print(f"Token not found for user '{username}', generating new token...")
+                    logger.info(f"Token not found for user '{username}', generating new token...")
                     # Generate new token
                     new_token = generate_user_token(username)
                     
                     # Add token to file
                     add_token_to_file(project, env, username, new_token)
                     
-                    print(f"Successfully generated and stored token for user '{username}'")
+                    logger.info(f"Successfully generated and stored token for user '{username}'")
                     return username, new_token
                     
                 except Exception as token_error:
+                    logger.error(f"Failed to generate token for user '{username}': {str(token_error)}")
                     raise HTTPException(
                         status_code=500,
                         detail=f"User has access but failed to generate token: {str(token_error)}"
                     )
             else:
                 # User doesn't have access, re-raise the original 404
+                logger.warning(f"User '{username}' does not have access to {project.value}/{env.value}")
                 raise e
         else:
             # Re-raise other HTTP exceptions
             raise e
     except Exception as e:
+        logger.error(f"Error getting user token for {username}: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"Error getting user token: {str(e)}"
@@ -329,6 +383,7 @@ def get_or_create_user_token(project: Project, env: Environment, username: str) 
 
 def get_user_token(project: Project, env: Environment, username: str) -> tuple[str, str]:
     """Centralized function to get user ID and token (with auto-creation)"""
+    logger.debug(f"Getting token for user '{username}' in {project.value}/{env.value}")
     return get_or_create_user_token(project, env, username)
 
 # Group configuration functions
@@ -342,6 +397,7 @@ def load_group_config(force_reload: bool = False) -> Dict[str, Any]:
         
         # Check if file exists
         if not os.path.exists(config_file_path):
+            logger.error(f"Group config file '{GROUP_CONFIG_FILE}' not found at {config_file_path}")
             raise HTTPException(status_code=404, detail=f"Group config file '{GROUP_CONFIG_FILE}' not found")
         
         # Check if file has been modified
@@ -352,18 +408,21 @@ def load_group_config(force_reload: bool = False) -> Dict[str, Any]:
             with open(config_file_path, 'r') as file:
                 GROUP_CONFIG = json.load(file)
             GROUP_CONFIG_LAST_MODIFIED = current_mtime
-            print(f"Group configuration reloaded at {datetime.now()}")
+            logger.info(f"Group configuration reloaded at {datetime.now()}")
             
         return GROUP_CONFIG
             
     except json.JSONDecodeError as e:
+        logger.error(f"Error parsing group config file: {e}")
         raise HTTPException(status_code=400, detail=f"Error parsing group config file: {e}")
     except Exception as e:
+        logger.error(f"Error loading group config: {e}")
         raise HTTPException(status_code=500, detail=f"Error loading group config: {e}")
 
 def get_user_groups(username: str) -> List[str]:
     """Get user groups using the 'groups' command"""
     try:
+        logger.info(f"Getting groups for user: {username}")
         # Execute the groups command
         result = subprocess.run(
             ['groups', username],
@@ -374,19 +433,26 @@ def get_user_groups(username: str) -> List[str]:
         
         # Parse the output - groups command returns: username : group1 group2 group3
         output = result.stdout.strip()
+        logger.debug(f"Groups command output for {username}: {output}")
+        
         if ':' in output:
             groups_part = output.split(':', 1)[1].strip()
             groups = groups_part.split()
+            logger.info(f"User '{username}' belongs to groups: {groups}")
             return groups
         else:
+            logger.warning(f"No groups found for user {username}")
             return []
             
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Groups command failed for user {username}, may not exist: {e.stderr}")
         # User might not exist or no groups
         return []
     except FileNotFoundError:
+        logger.error("'groups' command not available on this system")
         raise HTTPException(status_code=500, detail="'groups' command not available on this system")
     except Exception as e:
+        logger.error(f"Error getting user groups for {username}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error getting user groups: {e}")
 
 def check_project_access(user_groups: List[str], project_config: Dict[str, Any]) -> List[str]:
@@ -404,11 +470,14 @@ def check_project_access(user_groups: List[str], project_config: Dict[str, Any])
         if any(group in user_groups for group in required_groups):
             accessible_environments.append(env)
     
+    logger.debug(f"User has access to environments: {accessible_environments}")
     return accessible_environments
 
 def check_user_access_for_launch(username: str, project: Project, env: Environment) -> bool:
     """Check if user has access to launch session in the specified project and environment"""
     try:
+        logger.info(f"Checking access for user '{username}' in {project.value}/{env.value}")
+        
         # Load group configuration
         group_config = load_group_config()
         
@@ -422,6 +491,9 @@ def check_user_access_for_launch(username: str, project: Project, env: Environme
         env_config = project_config.get(env.value, {})
         required_groups = env_config.get("groups", [])
         
+        logger.debug(f"Required groups for {project.value}/{env.value}: {required_groups}")
+        logger.debug(f"User '{username}' groups: {user_groups}")
+        
         # Handle both string and list formats for groups
         if isinstance(required_groups, str):
             required_groups = [required_groups]
@@ -429,10 +501,12 @@ def check_user_access_for_launch(username: str, project: Project, env: Environme
         # Check if user has any of the required groups
         has_access = any(group in user_groups for group in required_groups)
         
+        logger.info(f"Access {'GRANTED' if has_access else 'DENIED'} for user '{username}' in {project.value}/{env.value}")
+        
         return has_access
         
     except Exception as e:
-        print(f"Error checking user access: {e}")
+        logger.error(f"Error checking user access for {username}: {e}")
         return False
 
 async def make_api_request(base_url: str, api_endpoint: str, payload: dict, token: str) -> Dict[str, Any]:
@@ -444,14 +518,22 @@ async def make_api_request(base_url: str, api_endpoint: str, payload: dict, toke
 
     try:
         formatted_base_url = format_base_url(base_url)
-        response = requests.request("POST", formatted_base_url + api_endpoint, 
+        full_url = formatted_base_url + api_endpoint
+        logger.info(f"Making API request to: {full_url}")
+        
+        response = requests.request("POST", full_url, 
                                   headers=headers, data=json.dumps(payload), verify=False)
+        
+        logger.info(f"API response status: {response.status_code}")
         response.raise_for_status()
         return json.loads(response.text)
         
     except requests.exceptions.RequestException as e:
+        logger.error(f"Request to external API failed: {e}")
+        logger.error(f"Request URL: {full_url}")
         raise HTTPException(status_code=500, detail=f"Request to external API failed: {e}")
     except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse response JSON: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to parse response JSON: {e}")
 
 async def validate_node_selection(base_url: str, node_selection: str, username: str) -> bool:
@@ -460,30 +542,29 @@ async def validate_node_selection(base_url: str, node_selection: str, username: 
         # Construct the node selection URL
         node_url = f"https://{base_url}:8084/cluster/{node_selection}/user/{username}"
         
-        print(f"Node selection URL: {node_url}")  # Debug logging
+        logger.info(f"Validating node selection: {node_url}")
         
         # No token required for this endpoint
         headers = {}
         
         response = requests.request("GET", node_url, headers=headers, verify=False)
         
-        print(f"Node selection response status: {response.status_code}")  # Debug logging
-        print(f"Node selection response text: {response.text[:200]}")  # Debug logging
+        logger.info(f"Node selection response status: {response.status_code}")
         
         response.raise_for_status()
         
         # If we get here, the node selection was successful
-        print(f"Node selection successful for node: {node_selection}")  # Debug logging
+        logger.info(f"Node selection successful for node: {node_selection}")
         return True
         
     except requests.exceptions.RequestException as e:
-        print(f"Node selection request error: {e}")  # Debug logging
+        logger.error(f"Node selection request error: {e}")
         raise HTTPException(
             status_code=400,
             detail=f"Node selection failed for node '{node_selection}': {str(e)}"
         )
     except Exception as e:
-        print(f"Node selection unexpected error: {e}")  # Debug logging
+        logger.error(f"Node selection unexpected error: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Unexpected error during node selection: {str(e)}"
@@ -491,6 +572,7 @@ async def validate_node_selection(base_url: str, node_selection: str, username: 
 
 async def get_sessions_api(base_url: str, token: str) -> Dict[str, Any]:
     """Get sessions using the provided API"""
+    logger.info(f"Getting sessions from {base_url}")
     payload = {
         "method": "get_session"
     }
@@ -501,6 +583,8 @@ async def stop_session_api(base_url: str, token: str, session_ids: List[str], fo
     """Stop/kill sessions using the provided API"""
     # Convert session_ids list to comma-separated string for the external API
     session_ids_str = ",".join(session_ids)
+    
+    logger.info(f"Stopping sessions: {session_ids_str}, force_quit: {force_quit}, suspend: {suspend_session}")
     
     payload = {
         "method": "stop_session",
@@ -521,12 +605,15 @@ def extract_session_info(base_url: str, session_data: Dict[str, Any]) -> Session
         display_name = session_data.get("name", session_data.get("session_name", ""))
     
     formatted_base_url = format_base_url(base_url)
-    return SessionInfo(
+    session_info = SessionInfo(
         session_id=session_data.get("id", ""),
         url=formatted_base_url + session_data.get("url", ""),
         session_name=display_name,
         display_name=display_name
     )
+    
+    logger.debug(f"Extracted session info: {session_info.session_id} - {session_info.display_name}")
+    return session_info
 
 def get_next_available_session_number(existing_sessions: List[SessionInfo]) -> int:
     """
@@ -548,6 +635,7 @@ def get_next_available_session_number(existing_sessions: List[SessionInfo]) -> i
     while next_number in used_numbers:
         next_number += 1
     
+    logger.info(f"Next available session number: {next_number} (used numbers: {sorted(used_numbers)})")
     return next_number
 
 async def launch_session_api(base_url: str, token: str, custom_session_name: Optional[str], workbench: str, cluster: str) -> tuple[dict, str]:
@@ -564,12 +652,14 @@ async def launch_session_api(base_url: str, token: str, custom_session_name: Opt
         # Use custom session name if provided, otherwise generate one
         if custom_session_name:
             unique_session_name = custom_session_name
+            logger.info(f"Using custom session name: {unique_session_name}")
         else:
             next_number = get_next_available_session_number(existing_sessions)
             unique_session_name = f"JupyterLab Session {next_number}"
+            logger.info(f"Generated session name: {unique_session_name}")
         
     except Exception as e:
-        print(f"Error getting existing sessions, using simple naming: {e}")
+        logger.warning(f"Error getting existing sessions, using simple naming: {e}")
         unique_session_name = f"JupyterLab Session 1"
     
     # Prepare launch parameters
@@ -590,6 +680,7 @@ async def launch_session_api(base_url: str, token: str, custom_session_name: Opt
         }
     }
     
+    logger.info(f"Launching session with name: {unique_session_name}, workbench: {workbench}, cluster: {cluster}")
     response_data = await make_api_request(base_url, LAUNCH_API, payload, token)
     return response_data, unique_session_name
 
@@ -599,20 +690,21 @@ async def startup_event():
     """Load tokens and group configuration data into memory when the application starts"""
     try:
         load_tokens_data()
-        print("Tokens data loaded successfully into memory")
+        logger.info("Tokens data loaded successfully into memory")
     except Exception as e:
-        print(f"Warning: Could not load tokens data on startup: {e}")
+        logger.error(f"Could not load tokens data on startup: {e}")
     
     try:
         load_group_config()
-        print("Group configuration loaded successfully into memory")
+        logger.info("Group configuration loaded successfully into memory")
     except Exception as e:
-        print(f"Warning: Could not load group configuration: {e}")
+        logger.error(f"Could not load group configuration: {e}")
 
 # Endpoints
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
+    logger.info("Root endpoint accessed")
     return {
         "message": "Session Management API",
         "version": "1.0.0",
@@ -634,6 +726,7 @@ async def root():
 @app.get("/env-projects")
 async def get_env_projects():
     """Get available environment and project combinations"""
+    logger.info("Environment-projects mapping requested")
     return {
         "environments": [env.value for env in Environment],
         "projects": [project.value for project in Project],
@@ -643,36 +736,52 @@ async def get_env_projects():
 @app.get("/tokens/{project}/{env}/{username}", response_model=TokenResponse)
 async def get_token(project: Project, env: Environment, username: str):
     """Get token for a specific user in a specific project and environment"""
-    token = get_token_from_memory(project.value, env, username)
-    available_users = get_available_users_from_memory(project, env)
-    
-    return TokenResponse(
-        username=username,
-        token=token,
-        available_users=available_users
-    )
+    logger.info(f"Token requested for user '{username}' in {project.value}/{env.value}")
+    try:
+        token = get_token_from_memory(project.value, env, username)
+        available_users = get_available_users_from_memory(project, env)
+        
+        logger.info(f"Token successfully retrieved for user '{username}'")
+        return TokenResponse(
+            username=username,
+            token=token,
+            available_users=available_users
+        )
+    except HTTPException:
+        logger.error(f"Failed to get token for user '{username}' in {project.value}/{env.value}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error getting token for {username}: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 @app.get("/available-users", response_model=AvailableUsersResponse)
 async def get_available_users_endpoint():
     """Get list of all available users from tokens file"""
+    logger.info("Available users list requested")
     users = get_available_users_from_memory()
+    logger.info(f"Returning {len(users)} available users")
     return AvailableUsersResponse(available_users=users)
 
 @app.get("/available-users/{project}", response_model=AvailableUsersResponse)
 async def get_available_users_by_project(project: Project):
     """Get list of available users for a specific project"""
+    logger.info(f"Available users requested for project: {project.value}")
     users = get_available_users_from_memory(project=project)
+    logger.info(f"Returning {len(users)} available users for project {project.value}")
     return AvailableUsersResponse(available_users=users)
 
 @app.get("/available-users/{project}/{env}", response_model=AvailableUsersResponse)
 async def get_available_users_by_project_env(project: Project, env: Environment):
     """Get list of available users for a specific project and environment"""
+    logger.info(f"Available users requested for {project.value}/{env.value}")
     users = get_available_users_from_memory(project=project, env=env)
+    logger.info(f"Returning {len(users)} available users for {project.value}/{env.value}")
     return AvailableUsersResponse(available_users=users)
 
 @app.get("/user-project-access/{username}", response_model=UserAccessResponse)
 async def get_user_project_access(username: str):
     """Get project access for a user based on group membership"""
+    logger.info(f"Project access check requested for user: {username}")
     try:
         # Load group configuration
         group_config = load_group_config()
@@ -689,6 +798,7 @@ async def get_user_project_access(username: str):
             if accessible_envs:
                 accessible_projects[project_name] = accessible_envs
         
+        logger.info(f"User '{username}' has access to: {accessible_projects}")
         return UserAccessResponse(
             username=username,
             user_groups=user_groups,
@@ -697,8 +807,10 @@ async def get_user_project_access(username: str):
         )
         
     except HTTPException:
+        logger.error(f"HTTP error checking user access for {username}")
         raise
     except Exception as e:
+        logger.error(f"Error checking user access for {username}: {e}")
         raise HTTPException(status_code=500, detail=f"Error checking user access: {e}")
 
 @app.get("/user-project-access", response_model=UserAccessResponse)
@@ -706,6 +818,7 @@ async def get_current_user_project_access(
     x_user_id: str = Header(..., description="Username to check access for")
 ):
     """Get project access for the current user (from header) based on group membership"""
+    logger.info(f"Current user project access requested for: {x_user_id}")
     return await get_user_project_access(x_user_id)
 
 @app.post("/launch-session", response_model=LaunchSessionResponse)
@@ -714,10 +827,13 @@ async def launch_session_endpoint(
     username: str = Header(..., description="Username to look up token from tokens.json")
 ):
     """Launch a session with the provided parameters"""
+    logger.info(f"Launch session request from user '{username}': {request.dict()}")
+    
     # First check if user has access to launch in this project and environment
     has_access = check_user_access_for_launch(username, request.project, request.env)
     
     if not has_access:
+        logger.warning(f"Access denied for user '{username}' in {request.project.value}/{request.env.value}")
         raise HTTPException(
             status_code=403,
             detail=f"User '{username}' does not have permission to launch sessions in project '{request.project.value}', environment '{request.env.value}'. Check group membership."
@@ -733,10 +849,12 @@ async def launch_session_endpoint(
     # For PROJECT1, if no node_selection provided, use "N" as default
     if request.project == Project.PROJECT1 and not request.node_selection:
         final_node_selection = "N"
+        logger.info(f"Using default node selection 'N' for PROJECT1")
     
     # For PROJECT2, ignore any node_selection provided by user
     if request.project == Project.PROJECT2:
         final_node_selection = None
+        logger.info(f"Ignoring node selection for PROJECT2")
 
     try:
         # For PROJECT1, validate node selection if provided (including default "N")
@@ -756,6 +874,7 @@ async def launch_session_endpoint(
             formatted_base_url = format_base_url(base_url)
             full_url = formatted_base_url + response_data["result"]["url"]
             
+            logger.info(f"Session launched successfully for user '{username}': {actual_session_name}")
             return LaunchSessionResponse(
                 success=True,
                 message="Session launched successfully",
@@ -763,15 +882,18 @@ async def launch_session_endpoint(
                 session_name=actual_session_name
             )
         else:
+            logger.error(f"Unexpected response format from external API for user '{username}': {response_data}")
             return LaunchSessionResponse(
                 success=False,
                 message="Unexpected response format from external API",
                 error=str(response_data)
             )
             
-    except HTTPException:
+    except HTTPException as he:
+        logger.error(f"HTTP exception during session launch for user '{username}': {he.detail}")
         raise
     except Exception as e:
+        logger.error(f"Failed to launch session for user '{username}': {e}")
         return LaunchSessionResponse(
             success=False,
             message="Failed to launch session",
@@ -785,6 +907,8 @@ async def get_sessions_endpoint(
     project: Project = Query(..., description="Project: PROJECT1 or PROJECT2")
 ):
     """Get all sessions for a user"""
+    logger.info(f"Get sessions request for user '{username}' in {project.value}/{env.value}")
+    
     # This will automatically generate token if user has access but token doesn't exist
     username, token = get_or_create_user_token(project, env, username)
     base_url = get_base_url(env, project)
@@ -798,21 +922,25 @@ async def get_sessions_endpoint(
                 session_info = extract_session_info(base_url, session_data)
                 sessions.append(session_info)
             
+            logger.info(f"Found {len(sessions)} sessions for user '{username}'")
             return GetSessionsResponse(
                 success=True,
                 message=f"Found {len(sessions)} sessions",
                 sessions=sessions
             )
         else:
+            logger.warning(f"No sessions found or unexpected response format for user '{username}'")
             return GetSessionsResponse(
                 success=False,
                 message="No sessions found or unexpected response format",
                 error=str(response_data) if response_data else "Empty response"
             )
             
-    except HTTPException:
+    except HTTPException as he:
+        logger.error(f"HTTP exception getting sessions for user '{username}': {he.detail}")
         raise
     except Exception as e:
+        logger.error(f"Failed to get sessions for user '{username}': {e}")
         return GetSessionsResponse(
             success=False,
             message="Failed to get sessions",
@@ -825,6 +953,8 @@ async def stop_session_endpoint(
     username: str = Header(..., description="Username to look up token from tokens.json")
 ):
     """Stop/kill one or more sessions by session_ids"""
+    logger.info(f"Stop session request from user '{username}': {request.dict()}")
+    
     # This will automatically generate token if user has access but token doesn't exist
     username, token = get_or_create_user_token(request.project, request.env, username)
     base_url = get_base_url(request.env, request.project)
@@ -839,21 +969,25 @@ async def stop_session_endpoint(
         )
 
         if response_data:
+            logger.info(f"Successfully stopped {len(request.session_ids)} sessions for user '{username}': {request.session_ids}")
             return StopSessionResponse(
                 success=True,
                 message=f"Successfully stopped {len(request.session_ids)} sessions",
                 stopped_sessions=request.session_ids
             )
         else:
+            logger.warning(f"Empty response from external API when stopping sessions for user '{username}'")
             return StopSessionResponse(
                 success=False,
                 message="Empty response from external API",
                 error="No response data received"
             )
             
-    except HTTPException:
+    except HTTPException as he:
+        logger.error(f"HTTP exception stopping sessions for user '{username}': {he.detail}")
         raise
     except Exception as e:
+        logger.error(f"Failed to stop sessions for user '{username}': {e}")
         return StopSessionResponse(
             success=False,
             message="Failed to stop sessions",
@@ -863,28 +997,35 @@ async def stop_session_endpoint(
 @app.post("/admin/reload-tokens", response_model=ReloadResponse)
 async def reload_tokens():
     """Reload tokens.json file"""
+    logger.info("Admin reload tokens request received")
     try:
         load_tokens_data(force_reload=True)
+        logger.info("Tokens data reloaded successfully via admin endpoint")
         return ReloadResponse(
             success=True,
             message="Tokens data reloaded successfully",
             timestamp=datetime.now().isoformat()
         )
     except Exception as e:
+        logger.error(f"Failed to reload tokens via admin endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to reload tokens: {e}")
 
 @app.post("/admin/reload-group-config", response_model=ReloadResponse)
 async def reload_group_config():
     """Reload group_config.json file"""
+    logger.info("Admin reload group config request received")
     try:
         load_group_config(force_reload=True)
+        logger.info("Group configuration reloaded successfully via admin endpoint")
         return ReloadResponse(
             success=True,
             message="Group configuration reloaded successfully",
             timestamp=datetime.now().isoformat()
         )
     except Exception as e:
+        logger.error(f"Failed to reload group config via admin endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to reload group config: {e}")
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    logger.info("Starting Session Management API server")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_config=None)
