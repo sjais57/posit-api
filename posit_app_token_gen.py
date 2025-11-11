@@ -224,58 +224,77 @@ def get_available_users_from_memory(project: Optional[Project] = None, env: Opti
         logger.error(f"Error getting available users: {e}")
         return []
 
-def generate_user_token(username: str) -> str:
-    """Generate API token for user using the pbrun command"""
+def generate_user_token(username: str, env: Environment, project: Project) -> str:
+    """Generate API token for user using the pbrun command via SSH"""
     try:
-        # Build the command
-        cmd = [
-            'pbrun', 'test', 
-            'root=rstudio-server generate-api-token', 
-            'user', 
-            f'username-token', 
-            username
+        # Get FQDN from ENV_PROJECT_MAP based on environment and project
+        fqdn = ENV_PROJECT_MAP.get(env, {}).get(project)
+        if not fqdn:
+            logger.error(f"No FQDN configured for environment '{env}' and project '{project}'")
+            raise Exception(f"No FQDN configured for environment '{env}' and project '{project}'")
+        
+        logger.info(f"Generating token for user '{username}' on {fqdn} ({env.value}/{project.value})")
+        
+        # SSH password (replace with actual password)
+        ssh_pass = "Password"
+        # SSH username (replace with actual SSH username)
+        ssh_username = "username"
+        
+        # Build the remote command
+        remote_cmd = f"pbrun test 'root=rstudio-server generate-api-token' user '{username}-token' {username}"
+        
+        # Build SSH command using list format
+        ssh_command = [
+            "sshpass", "-p", ssh_pass,
+            "ssh", "-o", "StrictHostKeyChecking=no", 
+            f"{ssh_username}@{fqdn}",
+            remote_cmd
         ]
         
-        logger.info(f"Executing token generation command for user: {username}")
-        logger.debug(f"Command: {' '.join(cmd)}")
-        
-        # Execute the command
-        result = subprocess.run(
-            cmd, 
-            capture_output=True, 
-            text=True, 
-            check=True
-        )
+        logger.info(f"Executing SSH command to {fqdn} for user: {username}")
+        logger.debug(f"SSH command: {' '.join(ssh_command)}")
+
+        # Run the SSH command
+        result = subprocess.run(ssh_command, check=True, text=True, capture_output=True)
         
         logger.info(f"Token generation command executed successfully for user: {username}")
         logger.debug(f"Command stdout: {result.stdout}")
         if result.stderr:
             logger.debug(f"Command stderr: {result.stderr}")
         
-        # Parse the output to extract the token using awk-like logic
-        output_lines = result.stdout.split('\n')
-        for line in output_lines:
+        # Process the output in Python instead of awk
+        output = result.stdout
+        token = None
+        
+        for line in output.splitlines():
             if '|' in line:
-                # Extract the token part after the pipe
                 parts = line.split('|')
                 if len(parts) >= 2:
                     token = parts[1].strip()
                     if token:  # Ensure it's not empty
                         logger.info(f"Token successfully extracted for user {username}")
-                        return token
+                        break
         
-        # If no token found in pipe format, try to find any non-empty line
-        for line in output_lines:
-            stripped_line = line.strip()
-            if stripped_line and not stripped_line.startswith('#'):
-                logger.info(f"Using non-pipe formatted token for user {username}")
-                return stripped_line
-                
-        logger.error(f"No token found in command output for user {username}")
-        raise Exception("No token found in command output")
+        if not token:
+            # If pipe format not found, try to find any non-empty line
+            for line in output.splitlines():
+                stripped_line = line.strip()
+                if stripped_line and not stripped_line.startswith('#'):
+                    token = stripped_line
+                    logger.info(f"Using non-pipe formatted token for user {username}")
+                    break
+        
+        if not token:
+            logger.error(f"No token found in command output for user {username}")
+            logger.error(f"Raw output: {output}")
+            raise Exception("No token found in command output")
+            
+        return token
         
     except subprocess.CalledProcessError as e:
-        logger.error(f"Token generation command failed for user {username}: {e.stderr}")
+        logger.error(f"Token generation command failed for user {username}")
+        logger.error(f"Return code: {e.returncode}")
+        logger.error(f"Error output: {e.stderr}")
         raise Exception(f"Token generation command failed: {e.stderr}")
     except Exception as e:
         logger.error(f"Error generating token for user {username}: {str(e)}")
@@ -352,8 +371,8 @@ def get_or_create_user_token(project: Project, env: Environment, username: str) 
             if has_access:
                 try:
                     logger.info(f"Token not found for user '{username}', generating new token...")
-                    # Generate new token
-                    new_token = generate_user_token(username)
+                    # Generate new token with environment and project parameters
+                    new_token = generate_user_token(username, env, project)
                     
                     # Add token to file
                     add_token_to_file(project, env, username, new_token)
@@ -380,7 +399,7 @@ def get_or_create_user_token(project: Project, env: Environment, username: str) 
             status_code=500,
             detail=f"Error getting user token: {str(e)}"
         )
-
+		
 def get_user_token(project: Project, env: Environment, username: str) -> tuple[str, str]:
     """Centralized function to get user ID and token (with auto-creation)"""
     logger.debug(f"Getting token for user '{username}' in {project.value}/{env.value}")
