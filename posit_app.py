@@ -55,6 +55,7 @@ class LaunchSessionResponse(BaseModel):
     message: str
     session_url: str = None
     session_name: str = None
+    selected_node: str = None
     error: str = None
 
 class SessionInfo(BaseModel):
@@ -141,7 +142,7 @@ def format_base_url(base_url: str) -> str:
         return f"https://{base_url}"
     return base_url
 
-# Token management functions
+# Token management functions (same as before)
 def load_tokens_data(force_reload: bool = False) -> Dict[str, Any]:
     """Load tokens data from JSON file into memory"""
     global TOKENS_DATA, TOKENS_LAST_MODIFIED
@@ -399,7 +400,7 @@ def get_or_create_user_token(project: Project, env: Environment, username: str) 
             status_code=500,
             detail=f"Error getting user token: {str(e)}"
         )
-
+		
 def get_user_token(project: Project, env: Environment, username: str) -> tuple[str, str]:
     """Centralized function to get user ID and token (with auto-creation)"""
     logger.debug(f"Getting token for user '{username}' in {project.value}/{env.value}")
@@ -528,115 +529,56 @@ def check_user_access_for_launch(username: str, project: Project, env: Environme
         logger.error(f"Error checking user access for {username}: {e}")
         return False
 
-# NODE SELECTION FUNCTIONS
-def get_node_server(node_selection: str) -> str:
+# UPDATED NODE SELECTION FUNCTION
+async def validate_node_selection(base_url: str, node_selection_flag: str, username: str) -> str:
     """
-    Run posit_select_node.py to get the server name for the selected node.
-    
-    Args:
-        node_selection: "P" or "V"
-    
-    Returns:
-        Server name from the script
-    """
-    try:
-        # Get the directory of the current script
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        node_selector_script = os.path.join(script_dir, "posit_select_node.py")
-        
-        if not os.path.exists(node_selector_script):
-            logger.error(f"Node selector script not found at {node_selector_script}")
-            raise HTTPException(
-                status_code=500,
-                detail="Node selection script not found"
-            )
-        
-        # Validate node selection
-        if node_selection.upper() not in ["P", "V"]:
-            logger.error(f"Invalid node selection: {node_selection}. Must be 'P' or 'V'")
-            raise HTTPException(
-                status_code=400,
-                detail="Node selection must be 'P' or 'V'"
-            )
-        
-        # Build command
-        cmd = ["python", node_selector_script, node_selection.upper()]
-        
-        logger.info(f"Running node selector: {' '.join(cmd)}")
-        
-        # Run the node selector script
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10  # 10 second timeout
-        )
-        
-        # Get the output (server name)
-        server_name = result.stdout.strip()
-        
-        if not server_name:
-            logger.error(f"Empty response from node selector script")
-            raise HTTPException(
-                status_code=500,
-                detail="Node selector script returned empty response"
-            )
-        
-        logger.info(f"Node selector returned server: {server_name} for node {node_selection}")
-        return server_name
-        
-    except subprocess.TimeoutExpired:
-        logger.error("Node selector script timed out")
-        raise HTTPException(
-            status_code=500,
-            detail="Node selection timed out"
-        )
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Node selector script failed: {e.stderr}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Node selection failed: {e.stderr}"
-        )
-    except Exception as e:
-        logger.error(f"Error getting node server: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error in node selection: {str(e)}"
-        )
+    Validate and determine the actual node using local CLI script for Project1.
 
-async def validate_node_selection(base_url: str, node_selection: str, username: str) -> bool:
-    """Validate node selection by making the node selection API call"""
+    Args:
+        base_url (str): The base URL for the cluster
+        node_selection_flag (str): Either "P" or "V" (user intent)
+        username (str): The username launching the session
+
+    Returns:
+        str: Final validated node name (e.g., node123.posit-cluster.dev)
+    """
     try:
-        # Construct the node selection URL
-        node_url = f"https://{base_url}:8084/cluster/{node_selection}/user/{username}"
+        logger.info(f"Running posit_select_node.py with flag: {node_selection_flag} for user: {username}")
         
-        logger.info(f"Validating node selection: {node_url}")
-        
-        # No token required for this endpoint
-        headers = {}
-        
-        response = requests.request("GET", node_url, headers=headers, verify=False)
-        
-        logger.info(f"Node selection response status: {response.status_code}")
-        
-        response.raise_for_status()
-        
-        # If we get here, the node selection was successful
-        logger.info(f"Node selection successful for node: {node_selection}")
-        return True
-        
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Node selection request error: {e}")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Node selection failed for node '{node_selection}': {str(e)}"
+        script_path = os.path.join(os.path.dirname(__file__), "posit_select_node.py")
+        if not os.path.exists(script_path):
+            raise FileNotFoundError(f"Node selection script not found at {script_path}")
+
+        # Validate node selection flag
+        if node_selection_flag.upper() not in ["P", "V"]:
+            raise ValueError(f"Invalid node selection flag: {node_selection_flag}. Must be 'P' or 'V'")
+
+        # Run the external CLI script and capture output
+        result = subprocess.run(
+            ["python3", script_path, node_selection_flag],
+            check=True,
+            capture_output=True,
+            text=True
         )
-    except Exception as e:
-        logger.error(f"Node selection unexpected error: {e}")
+        
+        selected_node = result.stdout.strip()
+        if not selected_node:
+            raise ValueError("Empty node returned from node selection script")
+
+        logger.info(f"Node selected by script: {selected_node}")
+        return selected_node
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Node selection script failed: {e.stderr}")
         raise HTTPException(
             status_code=500,
-            detail=f"Unexpected error during node selection: {str(e)}"
+            detail=f"Node selection script failed: {e.stderr}"
+        )
+    except Exception as e:
+        logger.error(f"Error in node selection logic: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error during node selection: {e}"
         )
 
 async def make_api_request(base_url: str, api_endpoint: str, payload: dict, token: str) -> Dict[str, Any]:
@@ -734,7 +676,8 @@ def get_next_available_session_number(existing_sessions: List[SessionInfo]) -> i
     logger.info(f"Next available session number: {next_number} (used numbers: {sorted(used_numbers)})")
     return next_number
 
-async def launch_session_api(base_url: str, token: str, custom_session_name: Optional[str], workbench: str, cluster: str) -> tuple[dict, str]:
+async def launch_session_api(base_url: str, token: str, custom_session_name: Optional[str], 
+                           workbench: str, cluster: str, placement_constraints: List[str] = None) -> tuple[dict, str]:
     """Launch a session using the provided API with unique name"""
     try:
         sessions_response = await get_sessions_api(base_url, token)
@@ -762,7 +705,7 @@ async def launch_session_api(base_url: str, token: str, custom_session_name: Opt
     launch_parameters = {
         "name": unique_session_name,
         "cluster": cluster,
-        "placement_constraints": [],
+        "placement_constraints": placement_constraints or [],
         "resource_limits": [],
         "queues": []
     }
@@ -776,7 +719,7 @@ async def launch_session_api(base_url: str, token: str, custom_session_name: Opt
         }
     }
     
-    logger.info(f"Launching session with name: {unique_session_name}, workbench: {workbench}, cluster: {cluster}")
+    logger.info(f"Launching session with name: {unique_session_name}, workbench: {workbench}, cluster: {cluster}, placement_constraints: {placement_constraints}")
     response_data = await make_api_request(base_url, LAUNCH_API, payload, token)
     return response_data, unique_session_name
 
@@ -816,7 +759,7 @@ async def root():
             "GET /user-project-access": "Get project access for current user (from X-User-ID header)",
             "POST /admin/reload-tokens": "Reload tokens.json file",
             "POST /admin/reload-group-config": "Reload group_config.json file",
-            "GET /select-node/{node}": "Get server name for specific node (P or V)"
+            "GET /select-node/{node_flag}": "Get server name for specific node (P or V)"
         }
     }
 
@@ -919,21 +862,67 @@ async def get_current_user_project_access(
     return await get_user_project_access(x_user_id)
 
 # NEW ENDPOINT: Get server name for node selection
-@app.get("/select-node/{node}")
-async def select_node(node: str):
-    """Get server name for specific node (P or V)"""
-    logger.info(f"Node selection requested: {node}")
+@app.get("/select-node/{node_flag}")
+async def select_node(node_flag: str):
+    """Get server name for specific node flag (P or V)"""
+    logger.info(f"Node selection requested: {node_flag}")
     
     try:
-        server_name = get_node_server(node)
+        # Validate node flag
+        if node_flag.upper() not in ["P", "V"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Node flag must be 'P' or 'V'"
+            )
+        
+        # Get the directory of the current script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        node_selector_script = os.path.join(script_dir, "posit_select_node.py")
+        
+        if not os.path.exists(node_selector_script):
+            raise HTTPException(
+                status_code=500,
+                detail="Node selection script not found"
+            )
+        
+        # Run the node selector script
+        result = subprocess.run(
+            ["python3", node_selector_script, node_flag.upper()],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10
+        )
+        
+        server_name = result.stdout.strip()
+        
+        if not server_name:
+            raise HTTPException(
+                status_code=500,
+                detail="Node selector script returned empty response"
+            )
+        
+        logger.info(f"Node selector returned server: {server_name} for node flag {node_flag}")
         return {
             "success": True,
-            "node": node.upper(),
+            "node_flag": node_flag.upper(),
             "server": server_name,
-            "message": f"Server for node {node.upper()}: {server_name}"
+            "message": f"Server for node {node_flag.upper()}: {server_name}"
         }
+        
+    except subprocess.TimeoutExpired:
+        logger.error("Node selector script timed out")
+        raise HTTPException(
+            status_code=500,
+            detail="Node selection timed out"
+        )
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Node selector script failed: {e.stderr}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Node selection failed: {e.stderr}"
+        )
     except HTTPException:
-        logger.error(f"Failed to get server for node {node}")
         raise
     except Exception as e:
         logger.error(f"Unexpected error getting node server: {e}")
@@ -961,48 +950,32 @@ async def launch_session_endpoint(
     username, token = get_or_create_user_token(request.project, request.env, username)
     base_url = get_base_url(request.env, request.project)
 
-    # Handle node selection logic
-    final_node_selection = request.node_selection
-    
-    # For PROJECT1, handle node selection
+    selected_node = None
+    placement_constraints = []
+
+    # Handle node selection logic based on project
     if request.project == Project.PROJECT1:
-        # If no node_selection provided, default to "P"
-        if not final_node_selection:
-            final_node_selection = "P"
-            logger.info(f"Using default node selection 'P' for PROJECT1")
+        # For PROJECT1, if no node_selection provided, default to "P"
+        final_node_selection_flag = request.node_selection or "P"
+        
+        # Validate the node selection flag
+        if final_node_selection_flag.upper() not in ["P", "V"]:
+            logger.warning(f"Invalid node selection '{final_node_selection_flag}' for PROJECT1, using default 'P'")
+            final_node_selection_flag = "P"
         else:
-            # Validate node selection is P or V
-            if final_node_selection.upper() not in ["P", "V"]:
-                logger.warning(f"Invalid node selection '{final_node_selection}' for PROJECT1, using default 'P'")
-                final_node_selection = "P"
-            else:
-                final_node_selection = final_node_selection.upper()
-                logger.info(f"Using provided node selection for PROJECT1: {final_node_selection}")
+            final_node_selection_flag = final_node_selection_flag.upper()
         
-        # Get server name from node selector script
-        try:
-            server_name = get_node_server(final_node_selection)
-            logger.info(f"Node selector returned server: {server_name} for node {final_node_selection}")
-            
-            # TODO: You might want to use the server_name in your launch parameters
-            # For example, you could modify the base_url or cluster based on server_name
-            # For now, we'll just log it and validate the node selection
-            
-        except HTTPException as e:
-            logger.error(f"Node selection failed: {e.detail}")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Node selection failed: {e.detail}"
-            )
+        # Run node selection script and get actual node name
+        selected_node = await validate_node_selection(base_url, final_node_selection_flag, username)
         
-        # Validate node selection with the external API
-        await validate_node_selection(base_url, final_node_selection, username)
+        logger.info(f"Validated node for Project1: {selected_node}")
+        # Add placement constraint for selected node
+        placement_constraints = [f"node=={selected_node}"]
     
-    # For PROJECT2, ignore any node_selection provided by user
-    if request.project == Project.PROJECT2:
-        if final_node_selection:
-            logger.info(f"Ignoring node selection '{final_node_selection}' for PROJECT2")
-        final_node_selection = None
+    else:
+        # PROJECT2 ignores node selection
+        if request.node_selection:
+            logger.info(f"Ignoring node selection '{request.node_selection}' for PROJECT2")
         logger.info(f"No node selection for PROJECT2")
 
     try:
@@ -1012,19 +985,25 @@ async def launch_session_endpoint(
             token=token,
             custom_session_name=request.session_name,
             workbench=request.workbench,
-            cluster=request.cluster
+            cluster=request.cluster,
+            placement_constraints=placement_constraints
         )
 
         if response_data and "result" in response_data and "url" in response_data["result"]:
             formatted_base_url = format_base_url(base_url)
             full_url = formatted_base_url + response_data["result"]["url"]
             
-            logger.info(f"Session launched successfully for user '{username}': {actual_session_name}")
+            response_message = "Session launched successfully"
+            if selected_node:
+                response_message += f" on node: {selected_node}"
+            
+            logger.info(f"Session launched successfully for user '{username}': {actual_session_name} on node: {selected_node}")
             return LaunchSessionResponse(
                 success=True,
-                message="Session launched successfully",
+                message=response_message,
                 session_url=full_url,
-                session_name=actual_session_name
+                session_name=actual_session_name,
+                selected_node=selected_node
             )
         else:
             logger.error(f"Unexpected response format from external API for user '{username}': {response_data}")
