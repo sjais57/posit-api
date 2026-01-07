@@ -1,4 +1,3 @@
-from datetime import datetime
 from fastapi import FastAPI, HTTPException, Header, Query
 from pydantic import BaseModel, Field
 import requests
@@ -7,8 +6,21 @@ import os
 import uvicorn
 import re
 import subprocess
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum
+from datetime import datetime
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('session_management.log')
+    ]
+)
+logger = logging.getLogger("session_management")
 
 app = FastAPI(title="Session Management API", version="1.0.0")
 
@@ -22,6 +34,11 @@ class Project(str, Enum):
     PROJECT1 = "PROJECT1"
     PROJECT2 = "PROJECT2"
 
+# Node types enum (for Project 1)
+class NodeType(str, Enum):
+    P = "P"  # Primary node
+    V = "V"  # Alternative node
+
 # Pydantic models for request/response
 class LaunchSessionRequest(BaseModel):
     session_name: Optional[str] = Field(None, description="Optional custom session name. If not provided, will generate as 'JupyterLab Session {number}'")
@@ -29,7 +46,7 @@ class LaunchSessionRequest(BaseModel):
     cluster: str = "Local"
     env: Environment = Field(..., description="Environment: DEV, UAT, or PROD")
     project: Project = Field(..., description="Project: PROJECT1 or PROJECT2")
-    node_selection: Optional[str] = Field(None, description="Node selection for the session (optional for both projects)")
+    node_selection: Optional[NodeType] = Field(None, description="Node selection for Project 1 only: 'P' or 'V'. If not provided, will auto-select.")
 
 class StopSessionRequest(BaseModel):
     session_ids: List[str] = Field(..., description="List of session IDs to stop")
@@ -43,6 +60,7 @@ class LaunchSessionResponse(BaseModel):
     message: str
     session_url: str = None
     session_name: str = None
+    node_selected: str = None
     error: str = None
 
 class SessionInfo(BaseModel):
@@ -50,6 +68,7 @@ class SessionInfo(BaseModel):
     url: str
     session_name: str
     display_name: str
+    node: str = None
 
 class GetSessionsResponse(BaseModel):
     success: bool
@@ -82,6 +101,13 @@ class ReloadResponse(BaseModel):
     message: str
     timestamp: str
 
+class NodeInfoResponse(BaseModel):
+    success: bool
+    message: str
+    selected_node: str
+    node_details: Dict[str, Any] = None
+    error: str = None
+
 # API endpoints (relative paths)
 LAUNCH_API = "/api/launch_session"
 GET_SESSION_API = "/api/get_session"
@@ -103,20 +129,46 @@ ENV_PROJECT_MAP = {
     }
 }
 
+# Node-specific configurations (for Project 1)
+NODE_CONFIGS = {
+    "P": {
+        "display_name": "Primary Node",
+        "cluster": "Primary",
+        "resource_constraints": {
+            "cpu": "high",
+            "memory": "high",
+            "gpu": "available"
+        }
+    },
+    "V": {
+        "display_name": "Alternative Node",
+        "cluster": "Alternative",
+        "resource_constraints": {
+            "cpu": "medium",
+            "memory": "medium",
+            "gpu": "not_available"
+        }
+    }
+}
+
 # Global variables to store data in memory
 TOKENS_DATA = None
 GROUP_CONFIG = None
 TOKENS_FILE = "tokens.json"
 GROUP_CONFIG_FILE = "group_config.json"
+TOKENS_LAST_MODIFIED = None
+GROUP_CONFIG_LAST_MODIFIED = None
 
 def get_base_url(env: Environment, project: Project) -> str:
     """Get base URL based on environment and project"""
     base_url = ENV_PROJECT_MAP.get(env, {}).get(project)
     if not base_url:
+        logger.error(f"No base URL configured for environment '{env}' and project '{project}'")
         raise HTTPException(
             status_code=400,
             detail=f"No base URL configured for environment '{env}' and project '{project}'"
         )
+    logger.debug(f"Base URL for {env}/{project}: {base_url}")
     return base_url
 
 def format_base_url(base_url: str) -> str:
@@ -125,10 +177,10 @@ def format_base_url(base_url: str) -> str:
         return f"https://{base_url}"
     return base_url
 
-# Token management functions
+# Token management functions (same as before)
 def load_tokens_data(force_reload: bool = False) -> Dict[str, Any]:
     """Load tokens data from JSON file into memory"""
-    global TOKENS_DATA
+    global TOKENS_DATA, TOKENS_LAST_MODIFIED
     
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -136,18 +188,26 @@ def load_tokens_data(force_reload: bool = False) -> Dict[str, Any]:
         
         # Check if file exists
         if not os.path.exists(token_file_path):
+            logger.error(f"Token file '{TOKENS_FILE}' not found at {token_file_path}")
             raise FileNotFoundError(f"Token file '{TOKENS_FILE}' not found")
         
-        # Load data if not already loaded or if force reload is requested
-        if TOKENS_DATA is None or force_reload:
+        # Check if file has been modified
+        current_mtime = os.path.getmtime(token_file_path)
+        
+        # Load data if not already loaded, force reload, or file has been modified
+        if TOKENS_DATA is None or force_reload or (TOKENS_LAST_MODIFIED and current_mtime > TOKENS_LAST_MODIFIED):
             with open(token_file_path, 'r') as file:
                 TOKENS_DATA = json.load(file)
+            TOKENS_LAST_MODIFIED = current_mtime
+            logger.info(f"Tokens data reloaded at {datetime.now()}")
             
         return TOKENS_DATA
             
     except json.JSONDecodeError as e:
+        logger.error(f"Error parsing JSON file '{TOKENS_FILE}': {e}")
         raise HTTPException(status_code=400, detail=f"Error parsing JSON file '{TOKENS_FILE}': {e}")
     except Exception as e:
+        logger.error(f"Error loading token file: {e}")
         raise HTTPException(status_code=500, detail=f"Error loading token file: {e}")
 
 def get_token_from_memory(project_name: str, env: Environment, username: str) -> str:
@@ -157,16 +217,20 @@ def get_token_from_memory(project_name: str, env: Environment, username: str) ->
     # Navigate through the nested structure: project_name -> env -> username
     project_data = tokens_data.get(project_name)
     if not project_data:
+        logger.warning(f"Project '{project_name}' not found in token file")
         raise HTTPException(status_code=404, detail=f"Project '{project_name}' not found in token file")
     
     env_data = project_data.get(env.value)
     if not env_data:
+        logger.warning(f"Environment '{env}' not found for project '{project_name}'")
         raise HTTPException(status_code=404, detail=f"Environment '{env}' not found for project '{project_name}'")
     
     token = env_data.get(username)
     if not token:
+        logger.warning(f"Token not found for user '{username}' in project '{project_name}', environment '{env}'")
         raise HTTPException(status_code=404, detail=f"Token not found for user '{username}' in project '{project_name}', environment '{env}'")
     
+    logger.debug(f"Token found for user '{username}' in {project_name}/{env.value}")
     return token
 
 def get_available_users_from_memory(project: Optional[Project] = None, env: Optional[Environment] = None) -> List[str]:
@@ -189,20 +253,198 @@ def get_available_users_from_memory(project: Optional[Project] = None, env: Opti
                 env_data = project_data.get(env_name, {})
                 users.update(env_data.keys())
         
+        logger.debug(f"Found {len(users)} available users for project={project}, env={env}")
         return sorted(list(users))
         
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error getting available users: {e}")
         return []
 
+def generate_user_token(username: str, env: Environment, project: Project) -> str:
+    """Generate API token for user using the pbrun command via SSH"""
+    try:
+        # Get FQDN from ENV_PROJECT_MAP based on environment and project
+        fqdn = ENV_PROJECT_MAP.get(env, {}).get(project)
+        if not fqdn:
+            logger.error(f"No FQDN configured for environment '{env}' and project '{project}'")
+            raise Exception(f"No FQDN configured for environment '{env}' and project '{project}'")
+        
+        logger.info(f"Generating token for user '{username}' on {fqdn} ({env.value}/{project.value})")
+        
+        # SSH password (replace with actual password)
+        ssh_pass = "Password"
+        # SSH username (replace with actual SSH username)
+        ssh_username = "username"
+        
+        # Build the remote command
+        remote_cmd = f"pbrun test 'root=rstudio-server generate-api-token' user '{username}-token' {username}"
+        
+        # Build SSH command using list format
+        ssh_command = [
+            "sshpass", "-p", ssh_pass,
+            "ssh", "-o", "StrictHostKeyChecking=no", 
+            f"{ssh_username}@{fqdn}",
+            remote_cmd
+        ]
+        
+        logger.info(f"Executing SSH command to {fqdn} for user: {username}")
+        logger.debug(f"SSH command: {' '.join(ssh_command)}")
+
+        # Run the SSH command
+        result = subprocess.run(ssh_command, check=True, text=True, capture_output=True)
+        
+        logger.info(f"Token generation command executed successfully for user: {username}")
+        logger.debug(f"Command stdout: {result.stdout}")
+        if result.stderr:
+            logger.debug(f"Command stderr: {result.stderr}")
+        
+        # Process the output in Python instead of awk
+        output = result.stdout
+        token = None
+        
+        for line in output.splitlines():
+            if '|' in line:
+                parts = line.split('|')
+                if len(parts) >= 2:
+                    token = parts[1].strip()
+                    if token:  # Ensure it's not empty
+                        logger.info(f"Token successfully extracted for user {username}")
+                        break
+        
+        if not token:
+            # If pipe format not found, try to find any non-empty line
+            for line in output.splitlines():
+                stripped_line = line.strip()
+                if stripped_line and not stripped_line.startswith('#'):
+                    token = stripped_line
+                    logger.info(f"Using non-pipe formatted token for user {username}")
+                    break
+        
+        if not token:
+            logger.error(f"No token found in command output for user {username}")
+            logger.error(f"Raw output: {output}")
+            raise Exception("No token found in command output")
+            
+        return token
+        
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Token generation command failed for user {username}")
+        logger.error(f"Return code: {e.returncode}")
+        logger.error(f"Error output: {e.stderr}")
+        raise Exception(f"Token generation command failed: {e.stderr}")
+    except Exception as e:
+        logger.error(f"Error generating token for user {username}: {str(e)}")
+        raise Exception(f"Error generating token: {str(e)}")
+
+def add_token_to_file(project: Project, env: Environment, username: str, token: str) -> None:
+    """Add or update user token in the tokens.json file"""
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        token_file_path = os.path.join(script_dir, TOKENS_FILE)
+        
+        logger.info(f"Adding token for user '{username}' in {project.value}/{env.value}")
+        
+        # Read existing data
+        if os.path.exists(token_file_path):
+            with open(token_file_path, 'r') as file:
+                tokens_data = json.load(file)
+            logger.debug(f"Successfully read existing token file")
+        else:
+            logger.info(f"Token file does not exist, creating new file")
+            tokens_data = {}
+        
+        # Ensure the nested structure exists
+        if project.value not in tokens_data:
+            logger.info(f"Creating new project section: {project.value}")
+            tokens_data[project.value] = {}
+        
+        if env.value not in tokens_data[project.value]:
+            logger.info(f"Creating new environment section: {env.value}")
+            tokens_data[project.value][env.value] = {}
+        
+        # Check if user already exists
+        user_exists = username in tokens_data[project.value][env.value]
+        if user_exists:
+            logger.warning(f"Overwriting existing token for user '{username}' in {project.value}/{env.value}")
+        else:
+            logger.info(f"Adding new user '{username}' to {project.value}/{env.value}")
+        
+        # Add or update the token
+        tokens_data[project.value][env.value][username] = token
+        
+        # Write back to file
+        with open(token_file_path, 'w') as file:
+            json.dump(tokens_data, file, indent=2)
+        
+        # Reload the in-memory data
+        global TOKENS_DATA, TOKENS_LAST_MODIFIED
+        TOKENS_DATA = tokens_data
+        TOKENS_LAST_MODIFIED = os.path.getmtime(token_file_path)
+        
+        logger.info(f"Successfully added token for user '{username}' in {project.value}/{env.value}")
+        
+    except Exception as e:
+        logger.error(f"Error updating token file for user {username}: {str(e)}")
+        raise Exception(f"Error updating token file: {str(e)}")
+
+def get_or_create_user_token(project: Project, env: Environment, username: str) -> tuple[str, str]:
+    """
+    Get user token from memory/file, or create if it doesn't exist.
+    Returns (username, token)
+    """
+    try:
+        # First try to get existing token
+        token = get_token_from_memory(project.value, env, username)
+        logger.info(f"Found existing token for user '{username}' in {project.value}/{env.value}")
+        return username, token
+        
+    except HTTPException as e:
+        # If token not found (404), check if user has access and create token
+        if e.status_code == 404:
+            # Check if user has access to this project/environment
+            has_access = check_user_access_for_launch(username, project, env)
+            
+            if has_access:
+                try:
+                    logger.info(f"Token not found for user '{username}', generating new token...")
+                    # Generate new token with environment and project parameters
+                    new_token = generate_user_token(username, env, project)
+                    
+                    # Add token to file
+                    add_token_to_file(project, env, username, new_token)
+                    
+                    logger.info(f"Successfully generated and stored token for user '{username}'")
+                    return username, new_token
+                    
+                except Exception as token_error:
+                    logger.error(f"Failed to generate token for user '{username}': {str(token_error)}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"User has access but failed to generate token: {str(token_error)}"
+                    )
+            else:
+                # User doesn't have access, re-raise the original 404
+                logger.warning(f"User '{username}' does not have access to {project.value}/{env.value}")
+                raise e
+        else:
+            # Re-raise other HTTP exceptions
+            raise e
+    except Exception as e:
+        logger.error(f"Error getting user token for {username}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting user token: {str(e)}"
+        )
+		
 def get_user_token(project: Project, env: Environment, username: str) -> tuple[str, str]:
-    """Centralized function to get user ID and token"""
-    token = get_token_from_memory(project.value, env, username)
-    return username, token
+    """Centralized function to get user ID and token (with auto-creation)"""
+    logger.debug(f"Getting token for user '{username}' in {project.value}/{env.value}")
+    return get_or_create_user_token(project, env, username)
 
 # Group configuration functions
 def load_group_config(force_reload: bool = False) -> Dict[str, Any]:
     """Load group configuration from JSON file"""
-    global GROUP_CONFIG
+    global GROUP_CONFIG, GROUP_CONFIG_LAST_MODIFIED
     
     try:
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -210,23 +452,32 @@ def load_group_config(force_reload: bool = False) -> Dict[str, Any]:
         
         # Check if file exists
         if not os.path.exists(config_file_path):
+            logger.error(f"Group config file '{GROUP_CONFIG_FILE}' not found at {config_file_path}")
             raise HTTPException(status_code=404, detail=f"Group config file '{GROUP_CONFIG_FILE}' not found")
         
-        # Load data if not already loaded or if force reload is requested
-        if GROUP_CONFIG is None or force_reload:
+        # Check if file has been modified
+        current_mtime = os.path.getmtime(config_file_path)
+        
+        # Load data if not already loaded, force reload, or file has been modified
+        if GROUP_CONFIG is None or force_reload or (GROUP_CONFIG_LAST_MODIFIED and current_mtime > GROUP_CONFIG_LAST_MODIFIED):
             with open(config_file_path, 'r') as file:
                 GROUP_CONFIG = json.load(file)
+            GROUP_CONFIG_LAST_MODIFIED = current_mtime
+            logger.info(f"Group configuration reloaded at {datetime.now()}")
             
         return GROUP_CONFIG
             
     except json.JSONDecodeError as e:
+        logger.error(f"Error parsing group config file: {e}")
         raise HTTPException(status_code=400, detail=f"Error parsing group config file: {e}")
     except Exception as e:
+        logger.error(f"Error loading group config: {e}")
         raise HTTPException(status_code=500, detail=f"Error loading group config: {e}")
 
 def get_user_groups(username: str) -> List[str]:
     """Get user groups using the 'groups' command"""
     try:
+        logger.info(f"Getting groups for user: {username}")
         # Execute the groups command
         result = subprocess.run(
             ['groups', username],
@@ -237,19 +488,26 @@ def get_user_groups(username: str) -> List[str]:
         
         # Parse the output - groups command returns: username : group1 group2 group3
         output = result.stdout.strip()
+        logger.debug(f"Groups command output for {username}: {output}")
+        
         if ':' in output:
             groups_part = output.split(':', 1)[1].strip()
             groups = groups_part.split()
+            logger.info(f"User '{username}' belongs to groups: {groups}")
             return groups
         else:
+            logger.warning(f"No groups found for user {username}")
             return []
             
-    except subprocess.CalledProcessError:
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Groups command failed for user {username}, may not exist: {e.stderr}")
         # User might not exist or no groups
         return []
     except FileNotFoundError:
+        logger.error("'groups' command not available on this system")
         raise HTTPException(status_code=500, detail="'groups' command not available on this system")
     except Exception as e:
+        logger.error(f"Error getting user groups for {username}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error getting user groups: {e}")
 
 def check_project_access(user_groups: List[str], project_config: Dict[str, Any]) -> List[str]:
@@ -267,11 +525,14 @@ def check_project_access(user_groups: List[str], project_config: Dict[str, Any])
         if any(group in user_groups for group in required_groups):
             accessible_environments.append(env)
     
+    logger.debug(f"User has access to environments: {accessible_environments}")
     return accessible_environments
 
 def check_user_access_for_launch(username: str, project: Project, env: Environment) -> bool:
     """Check if user has access to launch session in the specified project and environment"""
     try:
+        logger.info(f"Checking access for user '{username}' in {project.value}/{env.value}")
+        
         # Load group configuration
         group_config = load_group_config()
         
@@ -285,6 +546,9 @@ def check_user_access_for_launch(username: str, project: Project, env: Environme
         env_config = project_config.get(env.value, {})
         required_groups = env_config.get("groups", [])
         
+        logger.debug(f"Required groups for {project.value}/{env.value}: {required_groups}")
+        logger.debug(f"User '{username}' groups: {user_groups}")
+        
         # Handle both string and list formats for groups
         if isinstance(required_groups, str):
             required_groups = [required_groups]
@@ -292,11 +556,165 @@ def check_user_access_for_launch(username: str, project: Project, env: Environme
         # Check if user has any of the required groups
         has_access = any(group in user_groups for group in required_groups)
         
+        logger.info(f"Access {'GRANTED' if has_access else 'DENIED'} for user '{username}' in {project.value}/{env.value}")
+        
         return has_access
         
     except Exception as e:
-        print(f"Error checking user access: {e}")
+        logger.error(f"Error checking user access for {username}: {e}")
         return False
+
+# NODE SELECTION FUNCTIONS
+def run_posit_select_node(node_choice: str = None) -> Tuple[str, Dict[str, Any]]:
+    """
+    Run the posit_select_node.py script to select a node.
+    If node_choice is provided (P or V), use it. Otherwise, let the script auto-select.
+    
+    Returns: (selected_node, node_details)
+    """
+    try:
+        # Get the directory of the current script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        node_selector_script = os.path.join(script_dir, "posit_select_node.py")
+        
+        if not os.path.exists(node_selector_script):
+            logger.warning(f"Node selector script not found at {node_selector_script}")
+            # Fallback to default node selection
+            default_node = "P"
+            logger.info(f"Using default node: {default_node}")
+            return default_node, NODE_CONFIGS.get(default_node, {})
+        
+        # Build command
+        cmd = ["python3", node_selector_script]
+        if node_choice and node_choice.upper() in ["P", "V"]:
+            cmd.append(node_choice.upper())
+        
+        logger.info(f"Running node selector: {' '.join(cmd)}")
+        
+        # Run the node selector script
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30  # 30 second timeout
+        )
+        
+        # Parse the output
+        output = result.stdout.strip()
+        logger.info(f"Node selector output: {output}")
+        
+        # Extract node information from output
+        # Expected format: "Selected node: P" or "Selected node: V"
+        selected_node = None
+        node_details = {}
+        
+        # Try to parse JSON output
+        if output.startswith("{") or output.startswith("["):
+            try:
+                parsed_output = json.loads(output)
+                if isinstance(parsed_output, dict):
+                    if "selected_node" in parsed_output:
+                        selected_node = parsed_output["selected_node"]
+                        node_details = parsed_output.get("node_details", {})
+                    else:
+                        # Try to find node in keys
+                        for key in ["node", "selected", "selection"]:
+                            if key in parsed_output:
+                                selected_node = parsed_output[key]
+                                break
+        else:
+            # Text output parsing
+            lines = output.split('\n')
+            for line in lines:
+                line = line.strip().upper()
+                if "SELECTED" in line and ("P" in line or "V" in line):
+                    if "P" in line:
+                        selected_node = "P"
+                    elif "V" in line:
+                        selected_node = "V"
+                    break
+        
+        # Fallback if parsing failed
+        if not selected_node:
+            if node_choice and node_choice.upper() in ["P", "V"]:
+                selected_node = node_choice.upper()
+                logger.info(f"Using provided node choice: {selected_node}")
+            else:
+                # Auto-select based on some logic (could be time-based, round-robin, etc.)
+                selected_node = auto_select_node()
+                logger.info(f"Auto-selected node: {selected_node}")
+        
+        # Get node details from config
+        node_details = NODE_CONFIGS.get(selected_node, {}).copy()
+        
+        logger.info(f"Selected node: {selected_node}, Details: {node_details}")
+        return selected_node, node_details
+        
+    except subprocess.TimeoutExpired:
+        logger.error("Node selector script timed out")
+        default_node = "P"
+        return default_node, NODE_CONFIGS.get(default_node, {})
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Node selector script failed: {e.stderr}")
+        default_node = "P"
+        return default_node, NODE_CONFIGS.get(default_node, {})
+    except Exception as e:
+        logger.error(f"Error running node selector: {e}")
+        default_node = "P"
+        return default_node, NODE_CONFIGS.get(default_node, {})
+
+def auto_select_node() -> str:
+    """
+    Auto-select node based on some logic.
+    This could be extended with more sophisticated logic.
+    Currently using round-robin or load-based selection.
+    """
+    try:
+        # Simple round-robin based on timestamp
+        current_minute = datetime.now().minute
+        # Even minutes -> P, Odd minutes -> V (or vice versa)
+        selected_node = "P" if current_minute % 2 == 0 else "V"
+        
+        logger.info(f"Auto-selected node {selected_node} based on minute {current_minute}")
+        return selected_node
+    except Exception as e:
+        logger.error(f"Error in auto_select_node: {e}")
+        return "P"  # Default fallback
+
+async def validate_node_selection(base_url: str, node_selection: str, username: str) -> bool:
+    """Validate node selection by making the node selection API call"""
+    try:
+        # Construct the node selection URL
+        node_url = f"https://{base_url}:8084/cluster/{node_selection}/user/{username}"
+        
+        logger.info(f"Validating node selection: {node_url}")
+        
+        # No token required for this endpoint
+        headers = {}
+        
+        response = requests.request("GET", node_url, headers=headers, verify=False)
+        
+        logger.info(f"Node selection response status: {response.status_code}")
+        
+        response.raise_for_status()
+        
+        # If we get here, the node selection was successful
+        logger.info(f"Node selection successful for node: {node_selection}")
+        return True
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Node selection request error: {e}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Node selection failed for node '{node_selection}': {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Node selection unexpected error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error during node selection: {str(e)}"
+        )
 
 async def make_api_request(base_url: str, api_endpoint: str, payload: dict, token: str) -> Dict[str, Any]:
     """Make API request to external service"""
@@ -307,53 +725,27 @@ async def make_api_request(base_url: str, api_endpoint: str, payload: dict, toke
 
     try:
         formatted_base_url = format_base_url(base_url)
-        response = requests.request("POST", formatted_base_url + api_endpoint, 
+        full_url = formatted_base_url + api_endpoint
+        logger.info(f"Making API request to: {full_url}")
+        
+        response = requests.request("POST", full_url, 
                                   headers=headers, data=json.dumps(payload), verify=False)
+        
+        logger.info(f"API response status: {response.status_code}")
         response.raise_for_status()
         return json.loads(response.text)
         
     except requests.exceptions.RequestException as e:
+        logger.error(f"Request to external API failed: {e}")
+        logger.error(f"Request URL: {full_url}")
         raise HTTPException(status_code=500, detail=f"Request to external API failed: {e}")
     except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse response JSON: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to parse response JSON: {e}")
-
-async def validate_node_selection(base_url: str, node_selection: str, username: str) -> bool:
-    """Validate node selection by making the node selection API call"""
-    try:
-        # Construct the node selection URL
-        node_url = f"https://{base_url}:8084/cluster/{node_selection}/user/{username}"
-        
-        print(f"Node selection URL: {node_url}")  # Debug logging
-        
-        # No token required for this endpoint
-        headers = {}
-        
-        response = requests.request("GET", node_url, headers=headers, verify=False)
-        
-        print(f"Node selection response status: {response.status_code}")  # Debug logging
-        print(f"Node selection response text: {response.text[:200]}")  # Debug logging
-        
-        response.raise_for_status()
-        
-        # If we get here, the node selection was successful
-        print(f"Node selection successful for node: {node_selection}")  # Debug logging
-        return True
-        
-    except requests.exceptions.RequestException as e:
-        print(f"Node selection request error: {e}")  # Debug logging
-        raise HTTPException(
-            status_code=400,
-            detail=f"Node selection failed for node '{node_selection}': {str(e)}"
-        )
-    except Exception as e:
-        print(f"Node selection unexpected error: {e}")  # Debug logging
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error during node selection: {str(e)}"
-        )
 
 async def get_sessions_api(base_url: str, token: str) -> Dict[str, Any]:
     """Get sessions using the provided API"""
+    logger.info(f"Getting sessions from {base_url}")
     payload = {
         "method": "get_session"
     }
@@ -364,6 +756,8 @@ async def stop_session_api(base_url: str, token: str, session_ids: List[str], fo
     """Stop/kill sessions using the provided API"""
     # Convert session_ids list to comma-separated string for the external API
     session_ids_str = ",".join(session_ids)
+    
+    logger.info(f"Stopping sessions: {session_ids_str}, force_quit: {force_quit}, suspend: {suspend_session}")
     
     payload = {
         "method": "stop_session",
@@ -384,12 +778,26 @@ def extract_session_info(base_url: str, session_data: Dict[str, Any]) -> Session
         display_name = session_data.get("name", session_data.get("session_name", ""))
     
     formatted_base_url = format_base_url(base_url)
-    return SessionInfo(
+    
+    # Try to extract node information from session data
+    node_info = None
+    if "cluster" in session_data:
+        cluster = session_data.get("cluster", "")
+        if "primary" in cluster.lower() or "P" in cluster.upper():
+            node_info = "P"
+        elif "alternative" in cluster.lower() or "V" in cluster.upper():
+            node_info = "V"
+    
+    session_info = SessionInfo(
         session_id=session_data.get("id", ""),
         url=formatted_base_url + session_data.get("url", ""),
         session_name=display_name,
-        display_name=display_name
+        display_name=display_name,
+        node=node_info
     )
+    
+    logger.debug(f"Extracted session info: {session_info.session_id} - {session_info.display_name} - Node: {node_info}")
+    return session_info
 
 def get_next_available_session_number(existing_sessions: List[SessionInfo]) -> int:
     """
@@ -411,10 +819,12 @@ def get_next_available_session_number(existing_sessions: List[SessionInfo]) -> i
     while next_number in used_numbers:
         next_number += 1
     
+    logger.info(f"Next available session number: {next_number} (used numbers: {sorted(used_numbers)})")
     return next_number
 
-async def launch_session_api(base_url: str, token: str, custom_session_name: Optional[str], workbench: str, cluster: str) -> tuple[dict, str]:
-    """Launch a session using the provided API with unique name"""
+async def launch_session_api(base_url: str, token: str, custom_session_name: Optional[str], 
+                           workbench: str, cluster: str, node_type: str = None) -> tuple[dict, str]:
+    """Launch a session using the provided API with unique name and node selection"""
     try:
         sessions_response = await get_sessions_api(base_url, token)
         existing_sessions = []
@@ -427,15 +837,17 @@ async def launch_session_api(base_url: str, token: str, custom_session_name: Opt
         # Use custom session name if provided, otherwise generate one
         if custom_session_name:
             unique_session_name = custom_session_name
+            logger.info(f"Using custom session name: {unique_session_name}")
         else:
             next_number = get_next_available_session_number(existing_sessions)
             unique_session_name = f"JupyterLab Session {next_number}"
+            logger.info(f"Generated session name: {unique_session_name}")
         
     except Exception as e:
-        print(f"Error getting existing sessions, using simple naming: {e}")
+        logger.warning(f"Error getting existing sessions, using simple naming: {e}")
         unique_session_name = f"JupyterLab Session 1"
     
-    # Prepare launch parameters
+    # Prepare launch parameters with node selection
     launch_parameters = {
         "name": unique_session_name,
         "cluster": cluster,
@@ -443,6 +855,21 @@ async def launch_session_api(base_url: str, token: str, custom_session_name: Opt
         "resource_limits": [],
         "queues": []
     }
+    
+    # Add node-specific parameters if node_type is provided
+    if node_type and node_type.upper() in ["P", "V"]:
+        node_config = NODE_CONFIGS.get(node_type.upper(), {})
+        launch_parameters["cluster"] = node_config.get("cluster", cluster)
+        
+        # Add resource constraints based on node type
+        resource_constraints = node_config.get("resource_constraints", {})
+        if resource_constraints:
+            launch_parameters["resource_limits"] = [
+                {"resource": "cpu", "limit": resource_constraints.get("cpu", "medium")},
+                {"resource": "memory", "limit": resource_constraints.get("memory", "medium")},
+            ]
+            if resource_constraints.get("gpu") == "available":
+                launch_parameters["resource_limits"].append({"resource": "gpu", "limit": "available"})
     
     payload = {
         "method": "launch_session",
@@ -453,6 +880,7 @@ async def launch_session_api(base_url: str, token: str, custom_session_name: Opt
         }
     }
     
+    logger.info(f"Launching session with name: {unique_session_name}, workbench: {workbench}, cluster: {launch_parameters['cluster']}, node: {node_type}")
     response_data = await make_api_request(base_url, LAUNCH_API, payload, token)
     return response_data, unique_session_name
 
@@ -462,286 +890,4 @@ async def startup_event():
     """Load tokens and group configuration data into memory when the application starts"""
     try:
         load_tokens_data()
-        print("Tokens data loaded successfully into memory")
-    except Exception as e:
-        print(f"Warning: Could not load tokens data on startup: {e}")
-    
-    try:
-        load_group_config()
-        print("Group configuration loaded successfully into memory")
-    except Exception as e:
-        print(f"Warning: Could not load group configuration: {e}")
-
-# Endpoints
-@app.get("/")
-async def root():
-    """Root endpoint with API information"""
-    return {
-        "message": "Session Management API",
-        "version": "1.0.0",
-        "endpoints": {
-            "GET /tokens/{project}/{env}/{username}": "Get token for a specific user in project and environment",
-            "POST /launch-session": "Launch a new session (requires X-User-ID header, env, project in body; node_selection optional)",
-            "GET /sessions": "Get all sessions for a user (requires X-User-ID header, env and project in query params)",
-            "POST /stop-session": "Stop/kill one or more sessions (requires X-User-ID header, env and project in body)",
-            "GET /available-users": "Get list of available users",
-            "GET /env-projects": "Get available environment and project combinations",
-            "GET /user-project-access/{username}": "Get project access for a user based on group membership",
-            "GET /user-project-access": "Get project access for current user (from X-User-ID header)"
-        }
-    }
-
-@app.get("/env-projects")
-async def get_env_projects():
-    """Get available environment and project combinations"""
-    return {
-        "environments": [env.value for env in Environment],
-        "projects": [project.value for project in Project],
-        "mappings": ENV_PROJECT_MAP
-    }
-
-@app.get("/tokens/{project}/{env}/{username}", response_model=TokenResponse)
-async def get_token(project: Project, env: Environment, username: str):
-    """Get token for a specific user in a specific project and environment"""
-    token = get_token_from_memory(project.value, env, username)
-    available_users = get_available_users_from_memory()
-    
-    return TokenResponse(
-        username=username,
-        token=token,
-        available_users=available_users
-    )
-
-@app.get("/available-users", response_model=AvailableUsersResponse)
-async def get_available_users_endpoint():
-    """Get list of all available users from tokens file"""
-    users = get_available_users_from_memory()
-    return AvailableUsersResponse(available_users=users)
-
-@app.get("/available-users/{project}", response_model=AvailableUsersResponse)
-async def get_available_users_by_project(project: Project):
-    """Get list of available users for a specific project"""
-    users = get_available_users_from_memory(project=project)
-    return AvailableUsersResponse(available_users=users)
-
-@app.get("/available-users/{project}/{env}", response_model=AvailableUsersResponse)
-async def get_available_users_by_project_env(project: Project, env: Environment):
-    """Get list of available users for a specific project and environment"""
-    users = get_available_users_from_memory(project=project, env=env)
-    return AvailableUsersResponse(available_users=users)
-
-@app.get("/user-project-access/{username}", response_model=UserAccessResponse)
-async def get_user_project_access(username: str):
-    """Get project access for a user based on group membership"""
-    try:
-        # Load group configuration
-        group_config = load_group_config()
-        
-        # Get user's groups
-        user_groups = get_user_groups(username)
-        
-        # Check access for each project
-        accessible_projects = {}
-        
-        project_configs = group_config.get("project_name", {})
-        for project_name, project_config in project_configs.items():
-            accessible_envs = check_project_access(user_groups, project_config)
-            if accessible_envs:
-                accessible_projects[project_name] = accessible_envs
-        
-        return UserAccessResponse(
-            username=username,
-            user_groups=user_groups,
-            accessible_projects=accessible_projects,
-            has_access=bool(accessible_projects)
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error checking user access: {e}")
-
-@app.get("/user-project-access", response_model=UserAccessResponse)
-async def get_current_user_project_access(
-    x_user_id: str = Header(..., description="Username to check access for")
-):
-    """Get project access for the current user (from header) based on group membership"""
-    return await get_user_project_access(x_user_id)
-
-@app.post("/launch-session", response_model=LaunchSessionResponse)
-async def launch_session_endpoint(
-    request: LaunchSessionRequest,
-    username: str = Header(..., description="Username to look up token from tokens.json")
-):
-    """Launch a session with the provided parameters"""
-    # First check if user has access to launch in this project and environment
-    has_access = check_user_access_for_launch(username, request.project, request.env)
-    
-    if not has_access:
-        raise HTTPException(
-            status_code=403,
-            detail=f"User '{username}' does not have permission to launch sessions in project '{request.project.value}', environment '{request.env.value}'. Check group membership."
-        )
-    
-    username, token = get_user_token(request.project, request.env, username)
-    base_url = get_base_url(request.env, request.project)
-
-    # Handle node selection logic
-    final_node_selection = request.node_selection
-    
-    # For PROJECT1, if no node_selection provided, use "N" as default
-    if request.project == Project.PROJECT1 and not request.node_selection:
-        final_node_selection = "N"
-    
-    # For PROJECT2, ignore any node_selection provided by user
-    if request.project == Project.PROJECT2:
-        final_node_selection = None
-
-    try:
-        # For PROJECT1, validate node selection if provided (including default "N")
-        if request.project == Project.PROJECT1 and final_node_selection:
-            await validate_node_selection(base_url, final_node_selection, username)
-
-        # Now proceed with the actual launch session call
-        response_data, actual_session_name = await launch_session_api(
-            base_url=base_url,
-            token=token,
-            custom_session_name=request.session_name,
-            workbench=request.workbench,
-            cluster=request.cluster
-        )
-
-        if response_data and "result" in response_data and "url" in response_data["result"]:
-            formatted_base_url = format_base_url(base_url)
-            full_url = formatted_base_url + response_data["result"]["url"]
-            
-            return LaunchSessionResponse(
-                success=True,
-                message="Session launched successfully",
-                session_url=full_url,
-                session_name=actual_session_name
-            )
-        else:
-            return LaunchSessionResponse(
-                success=False,
-                message="Unexpected response format from external API",
-                error=str(response_data)
-            )
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        return LaunchSessionResponse(
-            success=False,
-            message="Failed to launch session",
-            error=str(e)
-        )
-
-@app.get("/sessions", response_model=GetSessionsResponse)
-async def get_sessions_endpoint(
-    username: str = Header(..., description="Username to look up token from tokens.json"),
-    env: Environment = Query(..., description="Environment: DEV, UAT, or PROD"),
-    project: Project = Query(..., description="Project: PROJECT1 or PROJECT2")
-):
-    """Get all sessions for a user"""
-    username, token = get_user_token(project, env, username)
-    base_url = get_base_url(env, project)
-
-    try:
-        response_data = await get_sessions_api(base_url, token)
-
-        if response_data and "result" in response_data and "sessions" in response_data["result"]:
-            sessions = []
-            for session_data in response_data["result"]["sessions"]:
-                session_info = extract_session_info(base_url, session_data)
-                sessions.append(session_info)
-            
-            return GetSessionsResponse(
-                success=True,
-                message=f"Found {len(sessions)} sessions",
-                sessions=sessions
-            )
-        else:
-            return GetSessionsResponse(
-                success=False,
-                message="No sessions found or unexpected response format",
-                error=str(response_data) if response_data else "Empty response"
-            )
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        return GetSessionsResponse(
-            success=False,
-            message="Failed to get sessions",
-            error=str(e)
-        )
-
-@app.post("/stop-session", response_model=StopSessionResponse)
-async def stop_session_endpoint(
-    request: StopSessionRequest,
-    username: str = Header(..., description="Username to look up token from tokens.json")
-):
-    """Stop/kill one or more sessions by session_ids"""
-    username, token = get_user_token(request.project, request.env, username)
-    base_url = get_base_url(request.env, request.project)
-
-    try:
-        response_data = await stop_session_api(
-            base_url=base_url,
-            token=token,
-            session_ids=request.session_ids,
-            force_quit=request.force_quit,
-            suspend_session=request.suspend_session
-        )
-
-        if response_data:
-            return StopSessionResponse(
-                success=True,
-                message=f"Successfully stopped {len(request.session_ids)} sessions",
-                stopped_sessions=request.session_ids
-            )
-        else:
-            return StopSessionResponse(
-                success=False,
-                message="Empty response from external API",
-                error="No response data received"
-            )
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        return StopSessionResponse(
-            success=False,
-            message="Failed to stop sessions",
-            error=str(e)
-        )
-
-@app.post("/admin/reload-tokens", response_model=ReloadResponse)
-async def reload_tokens():
-    """Reload tokens.json file"""
-    try:
-        load_tokens_data(force_reload=True)
-        return ReloadResponse(
-            success=True,
-            message="Tokens data reloaded successfully",
-            timestamp=datetime.now().isoformat()
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to reload tokens: {e}")
-
-@app.post("/admin/reload-group-config", response_model=ReloadResponse)
-async def reload_group_config():
-    """Reload group_config.json file"""
-    try:
-        load_group_config(force_reload=True)
-        return ReloadResponse(
-            success=True,
-            message="Group configuration reloaded successfully",
-            timestamp=datetime.now().isoformat()
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to reload group config: {e}")
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+        logger.info("Tokens data loaded successfully into memory
