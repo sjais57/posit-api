@@ -68,3 +68,25 @@ else:
     # PROJECT2 ignores node selection
     selected_node = None
 
+
+base_url = get_base_url(request.env, request.project)
+selected_node = None
+placement_constraints = []
+
+if request.project == Project.PROJECT1:
+    final_node_selection_flag = request.node_selection or "P"
+    if final_node_selection_flag.upper() not in ["P", "V"]:
+        logger.warning(f"Invalid node selection '{final_node_selection_flag}' for PROJECT1, using default 'P'")
+        final_node_selection_flag = "P"
+    else:
+        final_node_selection_flag = final_node_selection_flag.upper()
+
+    selected_node = await validate_node_selection(base_url, final_node_selection_flag, username)
+    logger.info(f"Selected node for Project1: {selected_node}")
+    
+    # 🟢 Override base_url to directly call selected node!
+    base_url = selected_node
+
+    # ❌ You no longer need placement_constraints
+    # placement_constraints = [f"node=={selected_node}"]
+
