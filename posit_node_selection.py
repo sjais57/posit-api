@@ -94,21 +94,39 @@ def get_server_list_path(project: Project) -> str:
 
 def get_base_url(env: Environment, project: Project) -> str:
     """
-    Read first server from project-specific server-list.txt
+    Read edgenode entry from project-specific server-list.txt
+    Format:
+      edgenode=server1,server2
+    Uses FIRST server only.
     """
     server_list_path = get_server_list_path(project)
 
     with open(server_list_path, "r") as f:
         for line in f:
             line = line.strip()
-            if line and not line.startswith("#"):
+
+            # Skip comments / empty lines
+            if not line or line.startswith("#"):
+                continue
+
+            # We ONLY care about edgenode
+            if line.lower().startswith("edgenode="):
+                servers = line.split("=", 1)[1]
+                server_list = [s.strip() for s in servers.split(",") if s.strip()]
+
+                if not server_list:
+                    break
+
+                selected_server = server_list[0]
                 logger.info(
-                    f"Using server '{line}' for {env.value}/{project.value}"
+                    f"Using edgenode server '{selected_server}' "
+                    f"for {env.value}/{project.value}"
                 )
-                return line
+                return selected_server
 
     raise HTTPException(
         status_code=500,
-        detail=f"No valid servers found in {server_list_path}"
+        detail=f"No edgenode entry found in {server_list_path}"
     )
+
 
