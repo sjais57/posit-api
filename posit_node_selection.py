@@ -69,24 +69,46 @@ else:
     selected_node = None
 
 
-base_url = get_base_url(request.env, request.project)
-selected_node = None
-placement_constraints = []
+def get_server_list_path(project: Project) -> str:
+    """
+    Resolve server-list.txt path from environment variable.
+    PROJECT1 -> PROJECT1_SERVER_LIST
+    PROJECT2 -> PROJECT2_SERVER_LIST
+    """
+    env_var = f"{project.value}_SERVER_LIST"
+    path = os.getenv(env_var)
 
-if request.project == Project.PROJECT1:
-    final_node_selection_flag = request.node_selection or "P"
-    if final_node_selection_flag.upper() not in ["P", "V"]:
-        logger.warning(f"Invalid node selection '{final_node_selection_flag}' for PROJECT1, using default 'P'")
-        final_node_selection_flag = "P"
-    else:
-        final_node_selection_flag = final_node_selection_flag.upper()
+    if not path:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Environment variable '{env_var}' is not set"
+        )
 
-    selected_node = await validate_node_selection(base_url, final_node_selection_flag, username)
-    logger.info(f"Selected node for Project1: {selected_node}")
-    
-    # 🟢 Override base_url to directly call selected node!
-    base_url = selected_node
+    if not os.path.exists(path):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Server list file not found at: {path}"
+        )
 
-    # ❌ You no longer need placement_constraints
-    # placement_constraints = [f"node=={selected_node}"]
+    return path
+
+def get_base_url(env: Environment, project: Project) -> str:
+    """
+    Read first server from project-specific server-list.txt
+    """
+    server_list_path = get_server_list_path(project)
+
+    with open(server_list_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                logger.info(
+                    f"Using server '{line}' for {env.value}/{project.value}"
+                )
+                return line
+
+    raise HTTPException(
+        status_code=500,
+        detail=f"No valid servers found in {server_list_path}"
+    )
 
