@@ -10,7 +10,10 @@ from typing import List, Dict, Any, Optional
 from enum import Enum
 from datetime import datetime
 import logging
-from collections import defaultdict
+
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -99,8 +102,10 @@ class ReloadResponse(BaseModel):
 class ServerConfigResponse(BaseModel):
     success: bool
     message: str
-    servers: Dict[str, Dict[str, List[str]]]
-    failed_servers: Dict[str, Dict[str, List[str]]]
+    project: str
+    server_list_path: str
+    servers: List[str]
+    selected_server: str
 
 # API endpoints (relative paths)
 LAUNCH_API = "/api/launch_session"
@@ -117,99 +122,63 @@ GROUP_CONFIG = None
 TOKENS_LAST_MODIFIED = None
 GROUP_CONFIG_LAST_MODIFIED = None
 
-# Server configuration
-SERVER_CONFIG = {}  # Will be loaded from server-list.txt files
-FAILED_SERVERS = defaultdict(lambda: defaultdict(list))  # Track failed servers
+# Simple server cache to avoid reading files on every request
+SERVER_CACHE = {}
 
-def load_server_config():
-    """Load server configuration from environment-specific server-list.txt files"""
-    global SERVER_CONFIG
-    
-    SERVER_CONFIG = {}
-    
-    # Read server list paths from environment variables
-    for env in Environment:
-        env_key = env.value
-        SERVER_CONFIG[env_key] = {}
-        
-        for project in Project:
-            project_key = project.value
-            
-            # Construct environment variable name
-            env_var_name = f"{env_key}_{project_key}_SERVER_LIST"
-            
-            # Get the server list file path from environment variable
-            server_list_path = os.getenv(env_var_name)
-            
-            if server_list_path:
-                try:
-                    if os.path.exists(server_list_path):
-                        with open(server_list_path, 'r') as f:
-                            servers = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-                        SERVER_CONFIG[env_key][project_key] = servers
-                        logger.info(f"Loaded {len(servers)} servers for {env_key}/{project_key} from {server_list_path}")
-                    else:
-                        logger.warning(f"Server list file not found at {server_list_path} for {env_key}/{project_key}")
-                        SERVER_CONFIG[env_key][project_key] = []
-                except Exception as e:
-                    logger.error(f"Error loading server list for {env_key}/{project_key}: {e}")
-                    SERVER_CONFIG[env_key][project_key] = []
-            else:
-                logger.warning(f"Environment variable {env_var_name} not set for {env_key}/{project_key}")
-                SERVER_CONFIG[env_key][project_key] = []
-    
-    return SERVER_CONFIG
+def get_server_list_path(project: Project) -> str:
+    """
+    Resolve server-list.txt path from environment variable.
+    PROJECT1 -> PROJECT1_SERVER_LIST
+    PROJECT2 -> PROJECT2_SERVER_LIST
+    """
+    env_var = f"{project.value}_SERVER_LIST"
+    path = os.getenv(env_var)
+
+    if not path:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Environment variable '{env_var}' is not set"
+        )
+
+    return path
 
 def get_base_url(env: Environment, project: Project) -> str:
-    """Get a server URL based on environment and project"""
-    # Load server config if not already loaded
-    if not SERVER_CONFIG:
-        load_server_config()
+    """
+    Read first server from project-specific server-list.txt
+    """
+    # Get the server list file path
+    server_list_path = get_server_list_path(project)
     
-    env_key = env.value
-    project_key = project.value
+    # Check if file exists
+    if not os.path.exists(server_list_path):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Server list file not found at: {server_list_path}"
+        )
     
-    # Get available servers for this env/project
-    all_servers = SERVER_CONFIG.get(env_key, {}).get(project_key, [])
+    # Try to get from cache first
+    cache_key = f"{env.value}_{project.value}"
+    if cache_key in SERVER_CACHE:
+        logger.debug(f"Using cached server for {env.value}/{project.value}")
+        return SERVER_CACHE[cache_key]
     
-    # Filter out failed servers
-    failed = FAILED_SERVERS.get(env_key, {}).get(project_key, [])
-    available_servers = [s for s in all_servers if s not in failed]
+    # Read the file and find first valid server
+    with open(server_list_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            # Skip empty lines and comments
+            if line and not line.startswith("#"):
+                logger.info(
+                    f"Using server '{line}' for {env.value}/{project.value}"
+                )
+                # Cache the result
+                SERVER_CACHE[cache_key] = line
+                return line
     
-    if not available_servers:
-        # If all servers are failed, try them anyway
-        if all_servers:
-            logger.warning(f"No available servers for {env_key}/{project_key}, trying failed servers")
-            available_servers = all_servers
-        else:
-            logger.error(f"No servers configured for environment '{env}' and project '{project}'")
-            raise HTTPException(
-                status_code=400,
-                detail=f"No servers configured for environment '{env}' and project '{project}'"
-            )
-    
-    # Return the first available server
-    selected_server = available_servers[0]
-    logger.info(f"Selected server {selected_server} for {env_key}/{project_key}")
-    return selected_server
-
-def mark_server_failed(env: Environment, project: Project, server: str):
-    """Mark a server as failed"""
-    env_key = env.value
-    project_key = project.value
-    
-    if server not in FAILED_SERVERS[env_key][project_key]:
-        FAILED_SERVERS[env_key][project_key].append(server)
-        logger.warning(f"Marked server {server} as failed for {env_key}/{project_key}")
-
-def mark_server_working(env: Environment, project: Project, server: str):
-    """Mark a server as working (remove from failed list)"""
-    env_key = env.value
-    project_key = project.value
-    
-    if server in FAILED_SERVERS.get(env_key, {}).get(project_key, []):
-        FAILED_SERVERS[env_key][project_key].remove(server)
-        logger.info(f"Marked server {server} as working for {env_key}/{project_key}")
+    raise HTTPException(
+        status_code=500,
+        detail=f"No valid servers found in {server_list_path}"
+    )
 
 def format_base_url(base_url: str) -> str:
     """Format base URL to ensure it has https:// prefix"""
@@ -303,7 +272,7 @@ def get_available_users_from_memory(project: Optional[Project] = None, env: Opti
 def generate_user_token(username: str, env: Environment, project: Project) -> str:
     """Generate API token for user using the pbrun command via SSH"""
     try:
-        # Get a server for this environment/project
+        # Get FQDN from server list
         base_url = get_base_url(env, project)
         if not base_url:
             logger.error(f"No server configured for environment '{env}' and project '{project}'")
@@ -365,20 +334,15 @@ def generate_user_token(username: str, env: Environment, project: Project) -> st
             logger.error(f"Raw output: {output}")
             raise Exception("No token found in command output")
             
-        # Mark server as working since token generation succeeded
-        mark_server_working(env, project, base_url)
         return token
         
     except subprocess.CalledProcessError as e:
         logger.error(f"Token generation command failed for user {username}")
         logger.error(f"Return code: {e.returncode}")
         logger.error(f"Error output: {e.stderr}")
-        mark_server_failed(env, project, base_url)
         raise Exception(f"Token generation command failed: {e.stderr}")
     except Exception as e:
         logger.error(f"Error generating token for user {username}: {str(e)}")
-        if 'base_url' in locals():
-            mark_server_failed(env, project, base_url)
         raise Exception(f"Error generating token: {str(e)}")
 
 def add_token_to_file(project: Project, env: Environment, username: str, token: str) -> None:
@@ -661,8 +625,8 @@ async def validate_node_selection(base_url: str, node_selection_flag: str, usern
             detail=f"Error during node selection: {e}"
         )
 
-async def make_api_request(base_url: str, api_endpoint: str, payload: dict, token: str, env: Environment, project: Project) -> Dict[str, Any]:
-    """Make API request to external service with retry logic"""
+async def make_api_request(base_url: str, api_endpoint: str, payload: dict, token: str) -> Dict[str, Any]:
+    """Make API request to external service"""
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {token}'
@@ -674,49 +638,30 @@ async def make_api_request(base_url: str, api_endpoint: str, payload: dict, toke
         logger.info(f"Making API request to: {full_url}")
         
         response = requests.request("POST", full_url, 
-                                  headers=headers, data=json.dumps(payload), verify=False, timeout=30)
+                                  headers=headers, data=json.dumps(payload), verify=False)
         
         logger.info(f"API response status: {response.status_code}")
+        response.raise_for_status()
+        return json.loads(response.text)
         
-        # Check if request was successful
-        if response.status_code >= 200 and response.status_code < 300:
-            # Mark server as working
-            mark_server_working(env, project, base_url)
-            response.raise_for_status()
-            return json.loads(response.text)
-        else:
-            # Mark server as failed for errors
-            mark_server_failed(env, project, base_url)
-            response.raise_for_status()
-            return json.loads(response.text)
-        
-    except requests.exceptions.Timeout:
-        logger.error(f"Request to {base_url} timed out")
-        mark_server_failed(env, project, base_url)
-        raise HTTPException(status_code=504, detail=f"Request to server timed out")
-    except requests.exceptions.ConnectionError:
-        logger.error(f"Connection error to {base_url}")
-        mark_server_failed(env, project, base_url)
-        raise HTTPException(status_code=503, detail=f"Connection to server failed")
     except requests.exceptions.RequestException as e:
         logger.error(f"Request to external API failed: {e}")
         logger.error(f"Request URL: {full_url}")
-        mark_server_failed(env, project, base_url)
         raise HTTPException(status_code=500, detail=f"Request to external API failed: {e}")
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse response JSON: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to parse response JSON: {e}")
 
-async def get_sessions_api(base_url: str, token: str, env: Environment, project: Project) -> Dict[str, Any]:
+async def get_sessions_api(base_url: str, token: str) -> Dict[str, Any]:
     """Get sessions using the provided API"""
     logger.info(f"Getting sessions from {base_url}")
     payload = {
         "method": "get_session"
     }
     
-    return await make_api_request(base_url, GET_SESSION_API, payload, token, env, project)
+    return await make_api_request(base_url, GET_SESSION_API, payload, token)
 
-async def stop_session_api(base_url: str, token: str, session_ids: List[str], force_quit: bool = False, suspend_session: bool = False, env: Environment = None, project: Project = None) -> Dict[str, Any]:
+async def stop_session_api(base_url: str, token: str, session_ids: List[str], force_quit: bool = False, suspend_session: bool = False) -> Dict[str, Any]:
     """Stop/kill sessions using the provided API"""
     # Convert session_ids list to comma-separated string for the external API
     session_ids_str = ",".join(session_ids)
@@ -732,7 +677,7 @@ async def stop_session_api(base_url: str, token: str, session_ids: List[str], fo
         }
     }
     
-    return await make_api_request(base_url, STOP_SESSION_API, payload, token, env, project)
+    return await make_api_request(base_url, STOP_SESSION_API, payload, token)
 
 def extract_session_info(base_url: str, session_data: Dict[str, Any]) -> SessionInfo:
     """Extract session information from the API response"""
@@ -776,10 +721,10 @@ def get_next_available_session_number(existing_sessions: List[SessionInfo]) -> i
     return next_number
 
 async def launch_session_api(base_url: str, token: str, custom_session_name: Optional[str], 
-                           workbench: str, cluster: str, placement_constraints: List[str] = None, env: Environment = None, project: Project = None) -> tuple[dict, str]:
+                           workbench: str, cluster: str, placement_constraints: List[str] = None) -> tuple[dict, str]:
     """Launch a session using the provided API with unique name"""
     try:
-        sessions_response = await get_sessions_api(base_url, token, env, project)
+        sessions_response = await get_sessions_api(base_url, token)
         existing_sessions = []
         
         if sessions_response and "result" in sessions_response and "sessions" in sessions_response["result"]:
@@ -819,7 +764,7 @@ async def launch_session_api(base_url: str, token: str, custom_session_name: Opt
     }
     
     logger.info(f"Launching session with name: {unique_session_name}, workbench: {workbench}, cluster: {cluster}, placement_constraints: {placement_constraints}")
-    response_data = await make_api_request(base_url, LAUNCH_API, payload, token, env, project)
+    response_data = await make_api_request(base_url, LAUNCH_API, payload, token)
     return response_data, unique_session_name
 
 # Load data into memory on startup
@@ -837,12 +782,6 @@ async def startup_event():
         logger.info("Group configuration loaded successfully into memory")
     except Exception as e:
         logger.error(f"Could not load group configuration: {e}")
-    
-    try:
-        load_server_config()
-        logger.info("Server configuration loaded successfully")
-    except Exception as e:
-        logger.error(f"Could not load server configuration: {e}")
 
 # Endpoints
 @app.get("/")
@@ -862,11 +801,9 @@ async def root():
             "GET /env-projects": "Get available environment and project combinations",
             "GET /user-project-access/{username}": "Get project access for a user based on group membership",
             "GET /user-project-access": "Get project access for current user (from X-User-ID header)",
-            "GET /server-config": "Get current server configuration",
+            "GET /server-config/{project}": "Get server configuration for a project",
             "POST /admin/reload-tokens": "Reload tokens.json file",
             "POST /admin/reload-group-config": "Reload group_config.json file",
-            "POST /admin/reload-servers": "Reload server configuration",
-            "POST /admin/reset-failed-servers": "Reset failed servers list",
             "GET /select-node/{node_flag}": "Get server name for specific node (P or V)"
         }
     }
@@ -875,23 +812,54 @@ async def root():
 async def get_env_projects():
     """Get available environment and project combinations"""
     logger.info("Environment-projects mapping requested")
+    
+    # Show available environment variables
+    env_vars = {}
+    for project in Project:
+        env_var = f"{project.value}_SERVER_LIST"
+        env_vars[env_var] = os.getenv(env_var, "NOT SET")
+    
     return {
         "environments": [env.value for env in Environment],
         "projects": [project.value for project in Project],
-        "server_config": SERVER_CONFIG,
-        "failed_servers": dict(FAILED_SERVERS)
+        "environment_variables": env_vars
     }
 
-@app.get("/server-config", response_model=ServerConfigResponse)
-async def get_server_config():
-    """Get current server configuration"""
-    logger.info("Server configuration requested")
-    return ServerConfigResponse(
-        success=True,
-        message="Server configuration retrieved successfully",
-        servers=SERVER_CONFIG,
-        failed_servers=dict(FAILED_SERVERS)
-    )
+@app.get("/server-config/{project}", response_model=ServerConfigResponse)
+async def get_server_config(project: Project):
+    """Get server configuration for a specific project"""
+    logger.info(f"Server configuration requested for project: {project.value}")
+    
+    try:
+        # Get the server list file path
+        server_list_path = get_server_list_path(project)
+        
+        # Read all servers from the file
+        servers = []
+        if os.path.exists(server_list_path):
+            with open(server_list_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        servers.append(line)
+        
+        # Get the currently selected server (first one)
+        selected_server = servers[0] if servers else None
+        
+        return ServerConfigResponse(
+            success=True,
+            message=f"Server configuration for {project.value}",
+            project=project.value,
+            server_list_path=server_list_path,
+            servers=servers,
+            selected_server=selected_server
+        )
+        
+    except HTTPException as e:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting server configuration: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting server configuration: {e}")
 
 @app.get("/tokens/{project}/{env}/{username}", response_model=TokenResponse)
 async def get_token(project: Project, env: Environment, username: str):
@@ -1091,6 +1059,10 @@ async def launch_session_endpoint(
         logger.info(f"Validated node for Project1: {selected_node}")
         # Add placement constraint for selected node
         placement_constraints = [f"node=={selected_node}"]
+    
+    else:
+        # PROJECT2 ignores node selection
+        base_url = get_base_url(request.env, request.project)
 
     try:
         # Now proceed with the actual launch session call
@@ -1100,9 +1072,7 @@ async def launch_session_endpoint(
             custom_session_name=request.session_name,
             workbench=request.workbench,
             cluster=request.cluster,
-            placement_constraints=placement_constraints,
-            env=request.env,
-            project=request.project
+            placement_constraints=placement_constraints
         )
 
         if response_data and "result" in response_data and "url" in response_data["result"]:
@@ -1154,7 +1124,7 @@ async def get_sessions_endpoint(
     base_url = get_base_url(env, project)
 
     try:
-        response_data = await get_sessions_api(base_url, token, env, project)
+        response_data = await get_sessions_api(base_url, token)
 
         if response_data and "result" in response_data and "sessions" in response_data["result"]:
             sessions = []
@@ -1205,9 +1175,7 @@ async def stop_session_endpoint(
             token=token,
             session_ids=request.session_ids,
             force_quit=request.force_quit,
-            suspend_session=request.suspend_session,
-            env=request.env,
-            project=request.project
+            suspend_session=request.suspend_session
         )
 
         if response_data:
@@ -1267,39 +1235,6 @@ async def reload_group_config():
     except Exception as e:
         logger.error(f"Failed to reload group config via admin endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to reload group config: {e}")
-
-@app.post("/admin/reload-servers", response_model=ReloadResponse)
-async def reload_servers():
-    """Reload server configuration from files"""
-    logger.info("Admin reload servers request received")
-    try:
-        load_server_config()
-        logger.info("Server configuration reloaded successfully via admin endpoint")
-        return ReloadResponse(
-            success=True,
-            message="Server configuration reloaded successfully",
-            timestamp=datetime.now().isoformat()
-        )
-    except Exception as e:
-        logger.error(f"Failed to reload servers via admin endpoint: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to reload servers: {e}")
-
-@app.post("/admin/reset-failed-servers", response_model=ReloadResponse)
-async def reset_failed_servers():
-    """Reset failed servers list"""
-    logger.info("Admin reset failed servers request received")
-    try:
-        global FAILED_SERVERS
-        FAILED_SERVERS = defaultdict(lambda: defaultdict(list))
-        logger.info("Failed servers list reset successfully")
-        return ReloadResponse(
-            success=True,
-            message="Failed servers list reset successfully",
-            timestamp=datetime.now().isoformat()
-        )
-    except Exception as e:
-        logger.error(f"Failed to reset failed servers: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to reset failed servers: {e}")
 
 if __name__ == "__main__":
     logger.info("Starting Session Management API server")
