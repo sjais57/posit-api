@@ -1037,39 +1037,53 @@ async def launch_session_endpoint(
     # This will automatically generate token if user has access but token doesn't exist
     username, token = get_or_create_user_token(request.project, request.env, username)
     base_url = get_base_url(request.env, request.project)
-
+    
     selected_node = None
     placement_constraints = []
-
-    # Handle node selection logic based on project
-    selected_node = None
-placement_constraints = []
-
-if request.project == Project.PROJECT1:
-    final_node_selection_flag = request.node_selection
-
-    if final_node_selection_flag:
-        try:
-            selected_node = await validate_node_selection(
-                base_url, final_node_selection_flag, username
+    
+    if request.project == Project.MALTS:
+        final_node_selection_flag = request.node_selection
+    
+        # Node selection is OPTIONAL
+        if final_node_selection_flag:
+            final_node_selection_flag = final_node_selection_flag.upper()
+    
+            if final_node_selection_flag not in ["P", "V"]:
+                logger.warning(
+                    f"Invalid node selection '{final_node_selection_flag}' for MALTS. "
+                    "Launching on base_url."
+                )
+            else:
+                try:
+                    selected_node = await validate_node_selection(
+                        base_url,
+                        final_node_selection_flag,
+                        username
+                    )
+    
+                    if selected_node:
+                        placement_constraints = [f"node=={selected_node}"]
+                        logger.info(f"Selected node for MALTS: {selected_node}")
+    
+                except Exception as e:
+                    logger.warning(
+                        f"Node selection failed ({e}). "
+                        "Launching on base_url."
+                    )
+        else:
+            logger.info(
+                "No node selection provided for MALTS. "
+                "Launching on base_url."
             )
-            placement_constraints = [f"node=={selected_node}"]
-            logger.info(f"Node selected for Project1: {selected_node}")
-        except Exception as e:
-            logger.warning(
-                f"Node selection failed ({e}). "
-                f"Falling back to base_url launch."
-            )
-    else:
-        logger.info(
-            "No node selection provided. "
-            "Launching session on base_url."
-        )
-
     
     else:
-        # PROJECT2 ignores node selection
-        base_url = get_base_url(request.env, request.project)
+        # GENERIC ignores node selection
+        if request.node_selection:
+            logger.info(
+                f"Ignoring node selection '{request.node_selection}' for GENERIC"
+            )
+        logger.info("No node selection for GENERIC")
+    
 
     try:
         # Now proceed with the actual launch session call
