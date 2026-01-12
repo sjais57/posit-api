@@ -1036,54 +1036,64 @@ async def launch_session_endpoint(
     
     # This will automatically generate token if user has access but token doesn't exist
     username, token = get_or_create_user_token(request.project, request.env, username)
-    base_url = get_base_url(request.env, request.project)
     
     selected_node = None
     placement_constraints = []
     
-    if request.project == Project.MALTS:
-        final_node_selection_flag = request.node_selection
-    
-        # Node selection is OPTIONAL
-        if final_node_selection_flag:
-            final_node_selection_flag = final_node_selection_flag.upper()
-    
-            if final_node_selection_flag not in ["P", "V"]:
-                logger.warning(
-                    f"Invalid node selection '{final_node_selection_flag}' for MALTS. "
-                    "Launching on base_url."
-                )
-            else:
-                try:
-                    selected_node = await validate_node_selection(
-                        base_url,
-                        final_node_selection_flag,
-                        username
-                    )
-    
-                    if selected_node:
-                        placement_constraints = [f"node=={selected_node}"]
-                        logger.info(f"Selected node for MALTS: {selected_node}")
-    
-                except Exception as e:
-                    logger.warning(
-                        f"Node selection failed ({e}). "
-                        "Launching on base_url."
-                    )
+    # Always get the base URL from ENV_PROJECT_MAP as the default/fallback
+    base_url = get_base_url(request.env, request.project)
+    logger.info(f"Base URL from ENV_PROJECT_MAP: {base_url}")
+
+    # Handle node selection logic based on project
+    if request.project == Project.PROJECT1:
+        # For PROJECT1, if no node_selection provided, default to "P"
+        final_node_selection_flag = request.node_selection or "P"
+        
+        # Validate the node selection flag format
+        if final_node_selection_flag.upper() not in ["P", "V"]:
+            logger.warning(f"Invalid node selection '{final_node_selection_flag}' for PROJECT1, using default 'P'")
+            final_node_selection_flag = "P"
         else:
-            logger.info(
-                "No node selection provided for MALTS. "
-                "Launching on base_url."
-            )
+            final_node_selection_flag = final_node_selection_flag.upper()
+        
+        try:
+            # Try to run node selection script and get actual node name
+            selected_node = await validate_node_selection(base_url, final_node_selection_flag, username)
+            
+            if selected_node:
+                logger.info(f"Validated node for Project1: {selected_node}")
+                # Use selected node as base_url for PROJECT1
+                base_url = selected_node  # Override with selected node
+                logger.info(f"Using selected node as base_url for PROJECT1: {base_url}")
+                
+                # Add placement constraint for selected node
+                placement_constraints = [f"node=={selected_node}"]
+            else:
+                # This shouldn't happen with your current validate_node_selection, but keeping as safety
+                logger.warning(f"Node selector returned None, using default base URL: {base_url}")
+                
+        except HTTPException as he:
+            # If node selection fails with HTTPException, log warning and continue with base_url
+            logger.warning(f"Node selection failed with HTTPException: {he.detail}")
+            logger.warning(f"Continuing with base URL: {base_url}")
+            # Don't re-raise, continue with base_url
+            selected_node = None
+            placement_constraints = []
+            
+        except Exception as e:
+            # Any other exception, log error and continue with base_url
+            logger.error(f"Unexpected error in node selection: {e}")
+            logger.warning(f"Continuing with base URL: {base_url}")
+            selected_node = None
+            placement_constraints = []
     
     else:
-        # GENERIC ignores node selection
+        # PROJECT2: Use standard base URL from ENV_PROJECT_MAP
+        # Ignore node selection for PROJECT2
         if request.node_selection:
-            logger.info(
-                f"Ignoring node selection '{request.node_selection}' for GENERIC"
-            )
-        logger.info("No node selection for GENERIC")
-    
+            logger.info(f"Ignoring node selection '{request.node_selection}' for PROJECT2")
+        
+        logger.info(f"No node selection for PROJECT2, using base_url: {base_url}")
 
     try:
         # Now proceed with the actual launch session call
@@ -1103,14 +1113,20 @@ async def launch_session_endpoint(
             response_message = "Session launched successfully"
             if selected_node:
                 response_message += f" on node: {selected_node}"
+            else:
+                # For Project2 or when node selection failed, show the host
+                if request.project == Project.PROJECT2:
+                    response_message += f" on Project2 host"
+                else:
+                    response_message += f" on default host"
             
-            logger.info(f"Session launched successfully for user '{username}': {actual_session_name} on node: {selected_node}")
+            logger.info(f"Session launched successfully for user '{username}': {actual_session_name} on: {selected_node if selected_node else base_url}")
             return LaunchSessionResponse(
                 success=True,
                 message=response_message,
                 session_url=full_url,
                 session_name=actual_session_name,
-                selected_node=selected_node
+                selected_node=selected_node if selected_node else "default_host"
             )
         else:
             logger.error(f"Unexpected response format from external API for user '{username}': {response_data}")
@@ -1130,7 +1146,7 @@ async def launch_session_endpoint(
             message="Failed to launch session",
             error=str(e)
         )
-
+        
 @app.get("/sessions", response_model=GetSessionsResponse)
 async def get_sessions_endpoint(
     username: str = Header(..., description="Username to look up token from tokens.json"),
