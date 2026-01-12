@@ -1042,23 +1042,30 @@ async def launch_session_endpoint(
     placement_constraints = []
 
     # Handle node selection logic based on project
-    if request.project == Project.PROJECT1:
-        # For PROJECT1, if no node_selection provided, default to "P"
-        final_node_selection_flag = request.node_selection or "P"
-        
-        # Validate the node selection flag
-        if final_node_selection_flag.upper() not in ["P", "V"]:
-            logger.warning(f"Invalid node selection '{final_node_selection_flag}' for PROJECT1, using default 'P'")
-            final_node_selection_flag = "P"
-        else:
-            final_node_selection_flag = final_node_selection_flag.upper()
-        
-        # Run node selection script and get actual node name
-        selected_node = await validate_node_selection(base_url, final_node_selection_flag, username)
-        
-        logger.info(f"Validated node for Project1: {selected_node}")
-        # Add placement constraint for selected node
-        placement_constraints = [f"node=={selected_node}"]
+    selected_node = None
+placement_constraints = []
+
+if request.project == Project.PROJECT1:
+    final_node_selection_flag = request.node_selection
+
+    if final_node_selection_flag:
+        try:
+            selected_node = await validate_node_selection(
+                base_url, final_node_selection_flag, username
+            )
+            placement_constraints = [f"node=={selected_node}"]
+            logger.info(f"Node selected for Project1: {selected_node}")
+        except Exception as e:
+            logger.warning(
+                f"Node selection failed ({e}). "
+                f"Falling back to base_url launch."
+            )
+    else:
+        logger.info(
+            "No node selection provided. "
+            "Launching session on base_url."
+        )
+
     
     else:
         # PROJECT2 ignores node selection
